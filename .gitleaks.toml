@@ -1,0 +1,19 @@
+# .gitleaks.toml
+# Gitleaks configuration file for Freefeed MCP
+# https://github.com/gitleaks/gitleaks
+
+title = "Freefeed MCP Configuration"
+
+# Allowlist for false positives
+[allowlist]
+description = "Allowlist for known false positives"
+
+# Allow lines with gitleaks:allow comment
+regexes = [
+    '''gitleaks:allow''',
+]
+
+# Documentation examples with placeholder tokens
+paths = [
+    '''docs/.*\.md$''',
+]

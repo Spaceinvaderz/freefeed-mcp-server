@@ -1,0 +1,45 @@
+repos:
+  - repo: https://github.com/trufflesecurity/trufflehog
+    rev: v3.90.2
+    hooks:
+      - id: trufflehog
+        name: trufflehog (secrets checker)
+        pass_filenames: false
+        stages: [pre-commit, pre-push]
+        exclude: '\.md$'
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
+        name: gitleaks (real secrets checker)
+        pass_filenames: false
+        stages: [pre-commit, pre-push]
+  # Python specific hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: debug-statements
+      - id: check-json
+      - id: check-merge-conflict
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        language_version: python3
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        name: isort (python)
+  - repo: https://github.com/pycqa/flake8
+    rev: 7.0.0
+    hooks:
+      - id: flake8
+        # Explicitly specify all the ignore rules from .flake8
+        args:
+          - --max-line-length=120
+          - --ignore=E501,W292,E305,E302,W503,W504,E226,E203
