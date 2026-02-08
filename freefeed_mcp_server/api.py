@@ -60,37 +60,47 @@ def _compact_whoami(payload: dict) -> dict:
     return compacted
 
 
+def _is_valid_user(user: Any) -> bool:
+    """Check if user has required id and username fields."""
+    return (
+        isinstance(user, dict) and bool(user.get("id")) and bool(user.get("username"))
+    )
+
+
+def _build_user_map(users: Any) -> dict[str, str]:
+    """Build a mapping of user IDs to usernames."""
+    if not isinstance(users, list):
+        return {}
+    return {user["id"]: user["username"] for user in users if _is_valid_user(user)}
+
+
+def _set_post_url(post: dict, base_url: str, user_map: dict[str, str]) -> None:
+    """Set the postUrl for a single post."""
+    if not isinstance(post, dict):
+        return
+    post_id = post.get("id")
+    short_id = post.get("shortId")
+    author_id = post.get("createdBy")
+    username = user_map.get(author_id)
+
+    if username and short_id:
+        post["postUrl"] = f"{base_url}/{username}/{short_id}"
+    elif post_id:
+        post["postUrl"] = f"{base_url}/posts/{post_id}"
+
+
 def _add_post_urls(payload: Any, base_url: str) -> Any:
     if not isinstance(payload, dict):
         return payload
 
-    users = payload.get("users")
-    user_map: dict[str, str] = {}
-    if isinstance(users, list):
-        for user in users:
-            if isinstance(user, dict) and user.get("id") and user.get("username"):
-                user_map[user["id"]] = user["username"]
-
-    def _apply(post: dict) -> None:
-        if not isinstance(post, dict):
-            return
-        post_id = post.get("id")
-        short_id = post.get("shortId")
-        author_id = post.get("createdBy")
-        username = user_map.get(author_id)
-
-        if username and short_id:
-            post["postUrl"] = f"{base_url}/{username}/{short_id}"
-        elif post_id:
-            post["postUrl"] = f"{base_url}/posts/{post_id}"
-
+    user_map = _build_user_map(payload.get("users"))
     posts = payload.get("posts")
+
     if isinstance(posts, list):
         for post in posts:
-            if isinstance(post, dict):
-                _apply(post)
+            _set_post_url(post, base_url, user_map)
     elif isinstance(posts, dict):
-        _apply(posts)
+        _set_post_url(posts, base_url, user_map)
 
     return payload
 
