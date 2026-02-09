@@ -174,9 +174,36 @@ class FreeFeedClient:
         return headers
 
     def _api_url(self, path: str) -> str:
-        """Build a versioned API URL for FreeFeed endpoints."""
-        normalized = path.lstrip("/")
-        return f"{self.base_url}/v{self.api_version}/{normalized}"
+        """Build a versioned API URL for FreeFeed endpoints.
+
+        The path must be a relative URL path without a scheme, host, query
+        string, or fragment. Individual path segments are percent-encoded
+        to safely include user-controlled values.
+        """
+        parsed = urlparse(path)
+
+        # Disallow absolute URLs or paths with their own query/fragment. All
+        # query parameters should be passed via the httpx request layer.
+        if parsed.scheme or parsed.netloc:
+            raise ValueError(f"API path must be relative, got: {path!r}")
+        if parsed.params or parsed.query or parsed.fragment:
+            raise ValueError(
+                f"API path must not contain params, query, or fragment: {path!r}"
+            )
+
+        normalized_path = parsed.path.lstrip("/")
+        if not normalized_path:
+            raise ValueError("API path must not be empty")
+
+        segments: List[str] = []
+        for segment in normalized_path.split("/"):
+            # Disallow empty / '.' / '..' segments to avoid ambiguous paths.
+            if segment in ("", ".", ".."):
+                raise ValueError(f"API path contains invalid segment: {path!r}")
+            segments.append(quote(segment, safe=""))
+
+        safe_path = "/".join(segments)
+        return f"{self.base_url}/v{self.api_version}/{safe_path}"
 
     async def authenticate(self) -> Dict[str, Any]:
         """Authenticate with FreeFeed API.
