@@ -40,10 +40,12 @@ This repository contains the FreeFeed MCP server (Python, FastAPI, MCP stdio).
 ## Security Recommendations
 
 - Apply defense-in-depth: validate inputs at API boundaries and again before internal use.
+- Never trust user input: treat all third-party data as attacker-controlled.
 - Minimize attack surface: avoid exposing passthrough URLs or file paths without allowlists.
 - Enforce least privilege: scope credentials to the minimum required and avoid reusing user-supplied tokens across requests.
 - Validate inputs against strict schemas (type, length, charset); reject early with clear errors.
 - Sanitize strings before use in interpreted contexts (URLs, file paths, queries).
-- Keep security layers usable: defaults should be safe without breaking common workflows.
+- Use cryptography for data in transit and at rest when needed.
 - Handle internal errors defensively: no stack traces to clients; return safe, structured errors.
 - Separate concerns: isolate networking, storage, and auth logic into distinct modules.
+- Keep security layers usable: defaults should be safe without breaking common workflows.
