@@ -55,6 +55,85 @@ After the server starts, interactive docs are available:
 curl http://localhost:8000/health
 ```
 
+### Auth and sessions
+
+You can authenticate in two ways:
+
+1) Pass-through credentials per request.
+2) Create a server-side session and send `X-Session-Token` on later requests.
+
+#### Create a session
+
+```bash
+curl -X POST http://localhost:8000/api/session \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "your_username",
+    "password": "your_password"
+  }'
+```
+
+Or with an app token:
+
+```bash
+curl -X POST http://localhost:8000/api/session \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auth_token": "your_app_token"
+  }'
+```
+
+The response includes a `session_token`. Use it on future requests:
+
+```bash
+curl http://localhost:8000/api/users/me \
+  -H "X-Session-Token: <session_token>"
+```
+
+#### Pass-through auth per request
+
+Use either an app token:
+
+```bash
+curl http://localhost:8000/api/users/me \
+  -H "X-Freefeed-Auth-Token: your_app_token"
+```
+
+Or an OAuth-style header:
+
+```bash
+curl http://localhost:8000/api/users/me \
+  -H "Authorization: Bearer your_app_token"
+```
+
+Or username/password headers:
+
+```bash
+curl http://localhost:8000/api/users/me \
+  -H "X-Freefeed-Username: your_username" \
+  -H "X-Freefeed-Password: your_password"
+```
+
+### Assistant
+
+The assistant endpoint uses PydanticAI with Anthropic.
+
+Required env vars:
+
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_MODEL` (optional, default: `claude-3-5-sonnet-latest`)
+
+```bash
+# Ask the assistant with constraints
+curl -X POST http://localhost:8000/api/assistant \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Summarize recent posts about MCP",
+    "timeline_type": "home",
+    "limit": 10
+  }'
+```
+
 ### Timeline
 
 ```bash

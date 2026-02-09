@@ -7,12 +7,13 @@ import json
 import logging
 import os
 import signal
+from mimetypes import guess_type
 from typing import Any
 
 import mcp.server.stdio
 from dotenv import load_dotenv
 from mcp.server import Server
-from mcp.types import TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool
 
 from .client import FreeFeedAPIError, FreeFeedAuthError, FreeFeedClient
 
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OPT_OUT_TAGS = ["#noai", "#opt-out-ai", "#no-bots", "#ai-free"]
 FILTER_REASON = "User opted out of AI interactions"
+DEFAULT_IMAGE_MAX_BYTES = 2_000_000
 
 
 def _parse_bool(value: str | None) -> bool | None:
@@ -45,6 +47,15 @@ def _parse_bool(value: str | None) -> bool | None:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _resolve_image_max_bytes() -> int:
+    raw = os.getenv("FREEFEED_MCP_IMAGE_MAX_BYTES", str(DEFAULT_IMAGE_MAX_BYTES))
+    try:
+        value = int(raw)
+        return max(256_000, value)
+    except ValueError:
+        return DEFAULT_IMAGE_MAX_BYTES
 
 
 def _load_opt_out_config() -> dict:
@@ -253,6 +264,42 @@ def _add_post_urls(payload: Any, base_url: str) -> Any:
         _apply(posts)
 
     return payload
+
+
+async def _fetch_attachment_data(
+    client: FreeFeedClient, attachment_url: str, max_bytes: int
+) -> tuple[bytes | None, str | None, int | None, str | None]:
+    content_type: str | None = None
+    content_length: int | None = None
+    headers: dict[str, str] = {}
+    if client.auth_token:
+        headers["X-Authentication-Token"] = client.auth_token
+
+    try:
+        head = await client.client.head(attachment_url, headers=headers)
+        if head.status_code < 400:
+            content_type = head.headers.get("content-type")
+            length_header = head.headers.get("content-length")
+            if length_header and length_header.isdigit():
+                content_length = int(length_header)
+    except Exception:
+        pass
+
+    if content_length is not None and content_length > max_bytes:
+        return None, content_type, content_length, "too_large"
+
+    response = await client.client.get(attachment_url, headers=headers)
+    response.raise_for_status()
+    if content_type is None:
+        content_type = response.headers.get("content-type")
+    data = response.content
+    if len(data) > max_bytes:
+        return None, content_type, len(data), "too_large"
+
+    if content_type is None:
+        content_type = guess_type(attachment_url)[0]
+
+    return data, content_type, len(data), None
 
 
 def should_skip_user(username: str, user_profile: dict) -> bool:
@@ -548,7 +595,11 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="download_attachment",
-            description="Download an attachment from a FreeFeed post. Can save to file or return as base64 data.",
+            description=(
+                "Download an attachment from a FreeFeed post. If the file is an image and "
+                "small enough, returns image content plus a URL fallback; otherwise returns a URL. "
+                "Can also save to file."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -559,6 +610,38 @@ async def list_tools() -> list[Tool]:
                     "save_path": {
                         "type": "string",
                         "description": "Optional path to save file. If not provided, returns base64-encoded data.",
+                    },
+                    "prefer_image": {
+                        "type": "boolean",
+                        "description": "Return image content when possible",
+                        "default": True,
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes to return for inline image data",
+                        "minimum": 256000,
+                    },
+                },
+                "required": ["attachment_url"],
+            },
+        ),
+        Tool(
+            name="get_attachment_image",
+            description=(
+                "Download an attachment and return image content when possible. "
+                "Returns image content plus a URL fallback; for large files, returns only the URL."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "attachment_url": {
+                        "type": "string",
+                        "description": "URL of the attachment to download (from post/comment data)",
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes to return for inline image data",
+                        "minimum": 256000,
                     },
                 },
                 "required": ["attachment_url"],
@@ -798,7 +881,7 @@ async def list_tools() -> list[Tool]:
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
+async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
     try:
         client = await get_client()
@@ -871,6 +954,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
         elif name == "download_attachment":
             save_path = arguments.get("save_path")
+            prefer_image = arguments.get("prefer_image", True)
+            max_bytes = arguments.get("max_bytes")
+            if not isinstance(max_bytes, int) or max_bytes <= 0:
+                max_bytes = _resolve_image_max_bytes()
 
             if save_path:
                 # Download and save to file
@@ -884,16 +971,99 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                     "message": f"Attachment downloaded to {saved_path}",
                 }
             else:
-                # Download as bytes and return base64
-                file_data = await client.download_attachment(
-                    attachment_url=arguments["attachment_url"],
+                attachment_url = arguments["attachment_url"]
+                file_data, content_type, size, error = await _fetch_attachment_data(
+                    client, attachment_url, max_bytes
                 )
+                if error == "too_large":
+                    result = {
+                        "success": False,
+                        "message": "Attachment is too large for inline data",
+                        "url": attachment_url,
+                        "max_bytes": max_bytes,
+                        "size": size,
+                        "content_type": content_type,
+                    }
+                elif (
+                    prefer_image and content_type and content_type.startswith("image/")
+                ):
+                    image_content = ImageContent(
+                        type="image",
+                        data=base64.b64encode(file_data or b"").decode("utf-8"),
+                        mimeType=content_type,
+                    )
+                    text_content = TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "success": True,
+                                "message": "Attachment returned as image content",
+                                "url": attachment_url,
+                                "size": size,
+                                "content_type": content_type,
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                    )
+                    return [image_content, text_content]
+                else:
+                    result = {
+                        "success": True,
+                        "data": base64.b64encode(file_data or b"").decode("utf-8"),
+                        "size": size,
+                        "message": "Attachment downloaded as base64 data",
+                        "content_type": content_type,
+                        "url": attachment_url,
+                    }
+
+        elif name == "get_attachment_image":
+            attachment_url = arguments["attachment_url"]
+            max_bytes = arguments.get("max_bytes")
+            if not isinstance(max_bytes, int) or max_bytes <= 0:
+                max_bytes = _resolve_image_max_bytes()
+
+            file_data, content_type, size, error = await _fetch_attachment_data(
+                client, attachment_url, max_bytes
+            )
+            if error == "too_large":
                 result = {
-                    "success": True,
-                    "data": base64.b64encode(file_data).decode("utf-8"),
-                    "size": len(file_data),
-                    "message": "Attachment downloaded as base64 data",
+                    "success": False,
+                    "message": "Attachment is too large for inline image data",
+                    "url": attachment_url,
+                    "max_bytes": max_bytes,
+                    "size": size,
+                    "content_type": content_type,
                 }
+            elif not content_type or not content_type.startswith("image/"):
+                result = {
+                    "success": False,
+                    "message": "Attachment is not an image",
+                    "url": attachment_url,
+                    "size": size,
+                    "content_type": content_type,
+                }
+            else:
+                image_content = ImageContent(
+                    type="image",
+                    data=base64.b64encode(file_data or b"").decode("utf-8"),
+                    mimeType=content_type,
+                )
+                text_content = TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "success": True,
+                            "message": "Attachment returned as image content",
+                            "url": attachment_url,
+                            "size": size,
+                            "content_type": content_type,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    ),
+                )
+                return [image_content, text_content]
 
         elif name == "get_post_attachments":
             # Get the post first

@@ -11,8 +11,9 @@
 
 ### 📥 Attachment downloads
 - ✅ `download_attachment` - download attachments
+- ✅ `get_attachment_image` - return image content with URL fallback
 - ✅ `get_post_attachments` - list post attachments
-- ✅ Download to file or as base64
+- ✅ Download to file, as base64, or as image content when possible
 - ✅ URLs for multiple sizes (original, thumbnail, thumbnail2)
 
 ### 👥 Groups

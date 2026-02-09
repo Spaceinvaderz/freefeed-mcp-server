@@ -10,6 +10,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
+    "pydantic-ai>=0.0.22",
+    "anthropic>=0.36.0",
 ]
 
 [project.optional-dependencies]

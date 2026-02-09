@@ -1,15 +1,20 @@
 """FreeFeed REST API - HTTP wrapper for MCP server."""
 
+import asyncio
+import contextlib
 import io
 import logging
 import os
-from typing import Any, List, Optional
+import uuid
+from dataclasses import dataclass
+from typing import Annotated, Any, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from .ai_agent import AssistantRequest, AssistantResponse, run_assistant
 from .client import FreeFeedAPIError, FreeFeedAuthError, FreeFeedClient
 
 # Load environment variables
@@ -115,6 +120,10 @@ app = FastAPI(
 # Global client instance
 freefeed_client: Optional[FreeFeedClient] = None
 
+# In-memory API sessions
+SESSION_STORE: dict[str, "SessionData"] = {}
+SESSION_LOCK = asyncio.Lock()
+
 
 async def get_client() -> FreeFeedClient:
     """Get or create FreeFeed client instance."""
@@ -160,6 +169,114 @@ async def get_client() -> FreeFeedClient:
                 raise HTTPException(status_code=401, detail=str(e))
 
     return freefeed_client
+
+
+@dataclass
+class SessionData:
+    auth_token: str
+    base_url: str
+    api_version: Optional[int]
+    username: Optional[str] = None
+
+
+class SessionCreate(BaseModel):
+    auth_token: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    base_url: Optional[str] = None
+    api_version: Optional[int] = None
+
+
+class SessionResponse(BaseModel):
+    session_token: str
+    user: Optional[dict[str, Any]] = None
+
+
+async def _create_client_from_credentials(
+    *,
+    auth_token: Optional[str],
+    username: Optional[str],
+    password: Optional[str],
+    base_url: Optional[str],
+    api_version: Optional[int],
+) -> FreeFeedClient:
+    if auth_token and (username or password):
+        raise HTTPException(
+            status_code=400,
+            detail="Use either auth_token or username/password, not both",
+        )
+    if not auth_token and (not username or not password):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide auth_token or username and password",
+        )
+
+    client = FreeFeedClient(
+        base_url=base_url or os.getenv("FREEFEED_BASE_URL", "https://freefeed.net"),
+        username=username,
+        password=password,
+        auth_token=auth_token,
+        api_version=api_version,
+    )
+
+    if auth_token:
+        await client.whoami()
+    else:
+        await client.authenticate()
+
+    return client
+
+
+async def _get_client_for_request(request: Request) -> FreeFeedClient:
+    if request is None:
+        return await get_client()
+
+    auth_token = request.headers.get("X-Freefeed-Auth-Token")
+    auth_header = request.headers.get("Authorization")
+    if not auth_token and auth_header:
+        if auth_header.lower().startswith("bearer "):
+            auth_token = auth_header.split(" ", 1)[1].strip()
+
+    username = request.headers.get("X-Freefeed-Username")
+    password = request.headers.get("X-Freefeed-Password")
+    session_token = request.headers.get("X-Session-Token")
+
+    if auth_token or (username and password):
+        client = await _create_client_from_credentials(
+            auth_token=auth_token,
+            username=username,
+            password=password,
+            base_url=request.headers.get("X-Freefeed-Base-Url"),
+            api_version=None,
+        )
+        request.state.request_client = client
+        return client
+
+    if session_token:
+        async with SESSION_LOCK:
+            session = SESSION_STORE.get(session_token)
+        if not session:
+            raise HTTPException(status_code=401, detail="Invalid session token")
+
+        client = FreeFeedClient(
+            base_url=session.base_url,
+            auth_token=session.auth_token,
+            api_version=session.api_version,
+        )
+        request.state.request_client = client
+        return client
+
+    return await get_client()
+
+
+@app.middleware("http")
+async def _close_request_client(request: Request, call_next):
+    request.state.request_client = None
+    response = await call_next(request)
+    client = getattr(request.state, "request_client", None)
+    if client is not None and client is not freefeed_client:
+        await client.close()
+    return response
 
 
 # Pydantic models for request/response
@@ -215,6 +332,55 @@ async def health_check():
         return {"status": "unhealthy", "error": str(e)}
 
 
+@app.post("/api/session", response_model=SessionResponse)
+async def create_session(payload: SessionCreate) -> SessionResponse:
+    """Create a server-side session using FreeFeed credentials."""
+    client: Optional[FreeFeedClient] = None
+    try:
+        client = await _create_client_from_credentials(
+            auth_token=payload.auth_token,
+            username=payload.username,
+            password=payload.password,
+            base_url=payload.base_url,
+            api_version=payload.api_version,
+        )
+        user = await client.whoami()
+        if not client.auth_token:
+            raise HTTPException(status_code=401, detail="FreeFeed auth failed")
+        session_token = str(uuid.uuid4())
+        session = SessionData(
+            auth_token=client.auth_token,
+            base_url=client.base_url,
+            api_version=client.api_version,
+            username=payload.username,
+        )
+        async with SESSION_LOCK:
+            SESSION_STORE[session_token] = session
+        return SessionResponse(session_token=session_token, user=user)
+    except HTTPException:
+        raise
+    except FreeFeedAuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
+
+
+@app.post("/api/assistant", response_model=AssistantResponse)
+async def assistant(payload: AssistantRequest, request: Request) -> AssistantResponse:
+    """AI assistant endpoint backed by PydanticAI."""
+    try:
+        client = await _get_client_for_request(request)
+        return await run_assistant(payload, client)
+    except FreeFeedAPIError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Timeline endpoints
 
 
@@ -224,10 +390,11 @@ async def get_timeline(
     username: Optional[str] = None,
     limit: Optional[int] = None,
     offset: Optional[int] = None,
+    request: Request = None,
 ):
     """Get timeline feed."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_timeline(
             username=username, timeline_type=timeline_type, limit=limit, offset=offset
         )
@@ -242,10 +409,10 @@ async def get_timeline(
 
 
 @app.get("/api/posts/{post_id}")
-async def get_post(post_id: str):
+async def get_post(post_id: str, request: Request):
     """Get a specific post."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_post(post_id)
         return _add_post_urls(result, client.base_url)
     except FreeFeedAPIError as e:
@@ -254,13 +421,14 @@ async def get_post(post_id: str):
 
 @app.post("/api/posts")
 async def create_post(
-    body: str = Form(...),
-    group_names: Optional[str] = Form(None),
-    files: Optional[List[UploadFile]] = File(None),
+    body: Annotated[str, Form(...)],
+    group_names: Annotated[Optional[str], Form()] = None,
+    files: Annotated[Optional[List[UploadFile]], File()] = None,
+    request: Request = None,
 ):
     """Create a new post with optional files and group posting."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
 
         # Parse group names if provided
         groups = group_names.split(",") if group_names else None
@@ -291,10 +459,10 @@ async def create_post(
 
 
 @app.put("/api/posts/{post_id}")
-async def update_post(post_id: str, data: PostUpdate):
+async def update_post(post_id: str, data: PostUpdate, request: Request):
     """Update a post."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.update_post(post_id, data.body)
         return _add_post_urls(result, client.base_url)
     except FreeFeedAPIError as e:
@@ -302,10 +470,10 @@ async def update_post(post_id: str, data: PostUpdate):
 
 
 @app.delete("/api/posts/{post_id}")
-async def delete_post(post_id: str):
+async def delete_post(post_id: str, request: Request):
     """Delete a post."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.delete_post(post_id)
         return result
     except FreeFeedAPIError as e:
@@ -313,10 +481,10 @@ async def delete_post(post_id: str):
 
 
 @app.post("/api/posts/{post_id}/like")
-async def like_post(post_id: str):
+async def like_post(post_id: str, request: Request):
     """Like a post."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.like_post(post_id)
         return result
     except FreeFeedAPIError as e:
@@ -324,10 +492,10 @@ async def like_post(post_id: str):
 
 
 @app.post("/api/posts/{post_id}/unlike")
-async def unlike_post(post_id: str):
+async def unlike_post(post_id: str, request: Request):
     """Unlike a post."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.unlike_post(post_id)
         return result
     except FreeFeedAPIError as e:
@@ -338,10 +506,10 @@ async def unlike_post(post_id: str):
 
 
 @app.post("/api/attachments")
-async def upload_attachment(file: UploadFile = File(...)):
+async def upload_attachment(file: Annotated[UploadFile, File(...)], request: Request):
     """Upload an attachment."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         file_data = await file.read()
         result = await client.upload_attachment(
             file_path=file.filename, file_data=file_data, filename=file.filename
@@ -352,10 +520,10 @@ async def upload_attachment(file: UploadFile = File(...)):
 
 
 @app.get("/api/posts/{post_id}/attachments")
-async def get_post_attachments(post_id: str):
+async def get_post_attachments(post_id: str, request: Request):
     """Get attachments for a post."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         post_data = await client.get_post(post_id)
 
         attachments = []
@@ -388,10 +556,10 @@ async def get_post_attachments(post_id: str):
 
 
 @app.get("/api/attachments/download")
-async def download_attachment(url: str):
+async def download_attachment(url: str, request: Request):
     """Download an attachment by URL."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         file_data = await client.download_attachment(url)
 
         # Return as streaming response
@@ -406,10 +574,10 @@ async def download_attachment(url: str):
 
 
 @app.post("/api/posts/{post_id}/comments")
-async def add_comment(post_id: str, data: CommentCreate):
+async def add_comment(post_id: str, data: CommentCreate, request: Request):
     """Add a comment to a post."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.add_comment(post_id, data.body)
         return result
     except FreeFeedAPIError as e:
@@ -417,10 +585,10 @@ async def add_comment(post_id: str, data: CommentCreate):
 
 
 @app.put("/api/comments/{comment_id}")
-async def update_comment(comment_id: str, data: CommentCreate):
+async def update_comment(comment_id: str, data: CommentCreate, request: Request):
     """Update a comment."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.update_comment(comment_id, data.body)
         return result
     except FreeFeedAPIError as e:
@@ -428,10 +596,10 @@ async def update_comment(comment_id: str, data: CommentCreate):
 
 
 @app.delete("/api/comments/{comment_id}")
-async def delete_comment(comment_id: str):
+async def delete_comment(comment_id: str, request: Request):
     """Delete a comment."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.delete_comment(comment_id)
         return result
     except FreeFeedAPIError as e:
@@ -443,11 +611,14 @@ async def delete_comment(comment_id: str):
 
 @app.get("/api/search")
 async def search_posts(
-    query: str, limit: Optional[int] = None, offset: Optional[int] = None
+    query: str,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    request: Request = None,
 ):
     """Search posts."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.search_posts(query, limit, offset)
         return _add_post_urls(result, client.base_url)
     except FreeFeedAPIError as e:
@@ -458,10 +629,10 @@ async def search_posts(
 
 
 @app.get("/api/users/{username}")
-async def get_user_profile(username: str):
+async def get_user_profile(username: str, request: Request):
     """Get user profile."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_user_profile(username)
         return result
     except FreeFeedAPIError as e:
@@ -469,10 +640,10 @@ async def get_user_profile(username: str):
 
 
 @app.get("/api/users/me")
-async def whoami(compact: bool = False):
+async def whoami(compact: bool = False, request: Request = None):
     """Get current authenticated user."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.whoami()
         if compact:
             result = _compact_whoami(result)
@@ -482,10 +653,10 @@ async def whoami(compact: bool = False):
 
 
 @app.get("/api/users/{username}/subscribers")
-async def get_subscribers(username: str):
+async def get_subscribers(username: str, request: Request):
     """Get user's subscribers."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_subscribers(username)
         return result
     except FreeFeedAPIError as e:
@@ -493,10 +664,10 @@ async def get_subscribers(username: str):
 
 
 @app.get("/api/users/{username}/subscriptions")
-async def get_subscriptions(username: str):
+async def get_subscriptions(username: str, request: Request):
     """Get user's subscriptions."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_subscriptions(username)
         return result
     except FreeFeedAPIError as e:
@@ -504,10 +675,10 @@ async def get_subscriptions(username: str):
 
 
 @app.post("/api/users/{username}/subscribe")
-async def subscribe_user(username: str):
+async def subscribe_user(username: str, request: Request):
     """Subscribe to a user."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.subscribe_user(username)
         return result
     except FreeFeedAPIError as e:
@@ -515,10 +686,10 @@ async def subscribe_user(username: str):
 
 
 @app.post("/api/users/{username}/unsubscribe")
-async def unsubscribe_user(username: str):
+async def unsubscribe_user(username: str, request: Request):
     """Unsubscribe from a user."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.unsubscribe_user(username)
         return result
     except FreeFeedAPIError as e:
@@ -529,10 +700,10 @@ async def unsubscribe_user(username: str):
 
 
 @app.get("/api/groups/my")
-async def get_my_groups():
+async def get_my_groups(request: Request):
     """Get list of groups user is member of."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_my_groups()
         return result
     except FreeFeedAPIError as e:
@@ -540,10 +711,10 @@ async def get_my_groups():
 
 
 @app.get("/api/groups/{group_name}")
-async def get_group_info(group_name: str):
+async def get_group_info(group_name: str, request: Request):
     """Get information about a group."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_group_info(group_name)
         return result
     except FreeFeedAPIError as e:
@@ -552,11 +723,14 @@ async def get_group_info(group_name: str):
 
 @app.get("/api/groups/{group_name}/timeline")
 async def get_group_timeline(
-    group_name: str, limit: Optional[int] = None, offset: Optional[int] = None
+    group_name: str,
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    request: Request = None,
 ):
     """Get timeline for a group."""
     try:
-        client = await get_client()
+        client = await _get_client_for_request(request)
         result = await client.get_group_timeline(group_name, limit, offset)
         return result
     except FreeFeedAPIError as e:

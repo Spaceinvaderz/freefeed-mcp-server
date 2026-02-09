@@ -17,7 +17,8 @@ MCP server for the FreeFeed API, a social network that replaces FriendFeed.
 
 ### Write
 - `upload_attachment` - Upload files (images, video, etc.)
-- `download_attachment` - Download post attachments
+- `download_attachment` - Download post attachments (returns image content when possible)
+- `get_attachment_image` - Download attachment as image content with URL fallback
 - `create_post` - Create a new post (auto uploads files, supports posting to groups)
 - `update_post` - Edit a post
 - `delete_post` - Delete a post
