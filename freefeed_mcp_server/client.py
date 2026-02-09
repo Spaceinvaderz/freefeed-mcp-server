@@ -5,6 +5,8 @@ import mimetypes
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 
@@ -673,7 +675,13 @@ class FreeFeedClient:
         Returns:
             Result payload
         """
-        url = self._api_url(f"posts/{post_id}/leave")
+        try:
+            UUID(post_id)
+        except ValueError as exc:
+            raise FreeFeedAPIError("Invalid post_id format") from exc
+
+        encoded_post_id = quote(post_id, safe="")
+        url = self._api_url(f"posts/{encoded_post_id}/leave")
         response = await self.client.post(url, headers=self._get_headers())
         response.raise_for_status()
         return response.json() if response.text else {"success": True}
