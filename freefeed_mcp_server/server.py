@@ -7,9 +7,12 @@ import json
 import logging
 import os
 import signal
+import time
 from mimetypes import guess_type
 from typing import Any
+from urllib.parse import urlparse
 
+import httpx
 import mcp.server.stdio
 from dotenv import load_dotenv
 from mcp.server import Server
@@ -36,6 +39,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_OPT_OUT_TAGS = ["#noai", "#opt-out-ai", "#no-bots", "#ai-free"]
 FILTER_REASON = "User opted out of AI interactions"
 DEFAULT_IMAGE_MAX_BYTES = 2_000_000
+MCP_TOOL_SUCCESS_LOG = "MCP tool success: %s duration_ms=%.1f"
+LIMIT_DESCRIPTION = "Number of posts to return"
+OFFSET_DESCRIPTION = "Offset for pagination"
 
 
 def _parse_bool(value: str | None) -> bool | None:
@@ -58,38 +64,36 @@ def _resolve_image_max_bytes() -> int:
         return DEFAULT_IMAGE_MAX_BYTES
 
 
-def _load_opt_out_config() -> dict:
-    config = {
-        "enabled": False,
-        "users": set(),
-        "tags": list(DEFAULT_OPT_OUT_TAGS),
-        "respect_private": True,
-        "respect_paused": True,
-    }
-
+def _load_config_from_file(config: dict) -> None:
+    """Load configuration from file if specified."""
     config_path = os.getenv("FREEFEED_OPTOUT_CONFIG")
-    if config_path:
-        try:
-            with open(config_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            if isinstance(data, dict):
-                if isinstance(data.get("enabled"), bool):
-                    config["enabled"] = data["enabled"]
-                if isinstance(data.get("manual_opt_out"), list):
-                    config["users"] = {
-                        str(u).strip() for u in data["manual_opt_out"] if str(u).strip()
-                    }
-                if isinstance(data.get("tags"), list):
-                    config["tags"] = [
-                        str(t).strip() for t in data["tags"] if str(t).strip()
-                    ]
-                if isinstance(data.get("respect_private"), bool):
-                    config["respect_private"] = data["respect_private"]
-                if isinstance(data.get("respect_paused"), bool):
-                    config["respect_paused"] = data["respect_paused"]
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Failed to read opt-out config %s: %s", config_path, exc)
+    if not config_path:
+        return
 
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return
+
+        if isinstance(data.get("enabled"), bool):
+            config["enabled"] = data["enabled"]
+        if isinstance(data.get("manual_opt_out"), list):
+            config["users"] = {
+                str(u).strip() for u in data["manual_opt_out"] if str(u).strip()
+            }
+        if isinstance(data.get("tags"), list):
+            config["tags"] = [str(t).strip() for t in data["tags"] if str(t).strip()]
+        if isinstance(data.get("respect_private"), bool):
+            config["respect_private"] = data["respect_private"]
+        if isinstance(data.get("respect_paused"), bool):
+            config["respect_paused"] = data["respect_paused"]
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Failed to read opt-out config %s: %s", config_path, exc)
+
+
+def _load_config_from_env(config: dict) -> None:
+    """Load configuration from environment variables."""
     enabled_env = _parse_bool(os.getenv("FREEFEED_OPTOUT_ENABLED"))
     if enabled_env is not None:
         config["enabled"] = enabled_env
@@ -109,6 +113,19 @@ def _load_opt_out_config() -> dict:
     respect_paused_env = _parse_bool(os.getenv("FREEFEED_OPTOUT_RESPECT_PAUSED"))
     if respect_paused_env is not None:
         config["respect_paused"] = respect_paused_env
+
+
+def _load_opt_out_config() -> dict:
+    config = {
+        "enabled": False,
+        "users": set(),
+        "tags": list(DEFAULT_OPT_OUT_TAGS),
+        "respect_private": True,
+        "respect_paused": True,
+    }
+
+    _load_config_from_file(config)
+    _load_config_from_env(config)
 
     return config
 
@@ -147,6 +164,7 @@ def _configure_server_logger() -> None:
     )
     file_handler.setLevel(_resolve_log_level())
     logger.addHandler(file_handler)
+    logger.setLevel(_resolve_log_level())
 
 
 _configure_server_logger()
@@ -231,52 +249,93 @@ def _compact_whoami(payload: dict) -> dict:
     return compacted
 
 
-def _add_post_urls(payload: Any, base_url: str) -> Any:
-    if not isinstance(payload, dict):
-        return payload
-
-    users = payload.get("users")
+def _build_post_user_map(payload: Any) -> dict[str, str]:
+    """Build a map of user IDs to usernames from payload."""
     user_map: dict[str, str] = {}
+    users = payload.get("users")
     if isinstance(users, list):
         for user in users:
             if isinstance(user, dict) and user.get("id") and user.get("username"):
                 user_map[user["id"]] = user["username"]
+    return user_map
 
-    def _apply(post: dict) -> None:
-        if not isinstance(post, dict):
-            return
-        post_id = post.get("id")
-        short_id = post.get("shortId")
-        author_id = post.get("createdBy")
-        username = user_map.get(author_id)
 
-        if username and short_id:
-            post["postUrl"] = f"{base_url}/{username}/{short_id}"
-        elif post_id:
-            post["postUrl"] = f"{base_url}/posts/{post_id}"
+def _apply_post_url(post: dict, base_url: str, user_map: dict[str, str]) -> None:
+    """Apply post URL to a single post."""
+    if not isinstance(post, dict):
+        return
+    author_id = post.get("createdBy")
+    username = user_map.get(author_id)
+    short_id = post.get("shortId")
+    post_id = post.get("id")
 
+    if username and short_id:
+        post["postUrl"] = f"{base_url}/{username}/{short_id}"
+    elif post_id:
+        post["postUrl"] = f"{base_url}/posts/{post_id}"
+
+
+def _add_post_urls(payload: Any, base_url: str) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    user_map = _build_post_user_map(payload)
     posts = payload.get("posts")
+
     if isinstance(posts, list):
         for post in posts:
-            if isinstance(post, dict):
-                _apply(post)
+            _apply_post_url(post, base_url, user_map)
     elif isinstance(posts, dict):
-        _apply(posts)
+        _apply_post_url(posts, base_url, user_map)
 
     return payload
 
 
-async def _fetch_attachment_data(
-    client: FreeFeedClient, attachment_url: str, max_bytes: int
+def _extract_attachment_id(url: str) -> str | None:
+    """Extract attachment ID from URL."""
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if "attachments" not in parts:
+        return None
+    idx = parts.index("attachments")
+    candidate = parts[idx + 1] if idx + 1 < len(parts) else None
+    if candidate and candidate.startswith("p") and idx + 2 < len(parts):
+        candidate = parts[idx + 2]
+    if not candidate:
+        return None
+    return candidate.split(".", 1)[0]
+
+
+def _get_fallback_urls(client: FreeFeedClient, attachment_url: str) -> list[str]:
+    """Get list of fallback URLs to try for attachment."""
+    urls = [attachment_url]
+    attachment_id = _extract_attachment_id(attachment_url)
+    if attachment_id:
+        fallback = f"{client.base_url}/attachments/{attachment_id}"
+        if fallback not in urls:
+            urls.append(fallback)
+        media_fallback = f"https://media.freefeed.net/attachments/{attachment_id}"
+        if media_fallback not in urls:
+            urls.append(media_fallback)
+    return urls
+
+
+async def _fetch_attachment_binary(
+    client: FreeFeedClient, url: str, max_bytes: int
 ) -> tuple[bytes | None, str | None, int | None, str | None]:
-    content_type: str | None = None
-    content_length: int | None = None
+    """Fetch binary data from a single URL with size validation."""
     headers: dict[str, str] = {}
     if client.auth_token:
         headers["X-Authentication-Token"] = client.auth_token
 
+    content_type: str | None = None
+    content_length: int | None = None
+
+    # Check headers first
     try:
-        head = await client.client.head(attachment_url, headers=headers)
+        head = await client.client.head(url, headers=headers)
+        if head.status_code == 404:
+            return None, content_type, None, "not_found"
         if head.status_code < 400:
             content_type = head.headers.get("content-type")
             length_header = head.headers.get("content-length")
@@ -288,8 +347,15 @@ async def _fetch_attachment_data(
     if content_length is not None and content_length > max_bytes:
         return None, content_type, content_length, "too_large"
 
-    response = await client.client.get(attachment_url, headers=headers)
-    response.raise_for_status()
+    # Fetch the actual data
+    try:
+        response = await client.client.get(url, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return None, content_type, None, "not_found"
+        return None, content_type, None, "http_error"
+
     if content_type is None:
         content_type = response.headers.get("content-type")
     data = response.content
@@ -297,9 +363,62 @@ async def _fetch_attachment_data(
         return None, content_type, len(data), "too_large"
 
     if content_type is None:
-        content_type = guess_type(attachment_url)[0]
+        content_type = guess_type(url)[0]
 
     return data, content_type, len(data), None
+
+
+async def _try_html_preview(
+    client: FreeFeedClient, url: str, max_bytes: int
+) -> tuple[bytes | None, str | None, int | None, str | None] | None:
+    """Try to get preview URL for HTML attachment."""
+    attachment_id = _extract_attachment_id(url)
+    if not attachment_id:
+        return None
+
+    try:
+        preview = await client.get_attachment_preview_url(
+            attachment_id, preview_type="original"
+        )
+        preview_url = None
+        if isinstance(preview, dict):
+            preview_url = preview.get("url")
+        if preview_url:
+            logger.info(
+                "Attachment HTML fallback: using preview URL %s",
+                preview_url,
+            )
+            return await _fetch_attachment_binary(client, preview_url, max_bytes)
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_attachment_data(
+    client: FreeFeedClient, attachment_url: str, max_bytes: int
+) -> tuple[bytes | None, str | None, int | None, str | None]:
+    """Fetch and validate attachment data."""
+    urls = _get_fallback_urls(client, attachment_url)
+
+    for url in urls:
+        data, content_type, size, error = await _fetch_attachment_binary(
+            client, url, max_bytes
+        )
+        if error == "not_found":
+            continue
+        if error:
+            return data, content_type, size, error
+        if content_type and content_type.startswith("text/html"):
+            preview_result = await _try_html_preview(client, url, max_bytes)
+            if preview_result:
+                data, content_type, size, error = preview_result
+                if not error:
+                    return data, content_type, size, None
+            return data, content_type, size, "html_response"
+
+        return data, content_type, size, None
+
+    return None, None, None, "not_found"
 
 
 def should_skip_user(username: str, user_profile: dict) -> bool:
@@ -338,23 +457,11 @@ def _build_user_map(payload: dict) -> dict[str, dict]:
     return {}
 
 
-def _filter_posts_payload(payload: Any) -> Any:
-    if not isinstance(payload, dict):
-        return payload
-
-    config = _load_opt_out_config()
-    if not config["enabled"]:
-        return payload
-
-    posts = payload.get("posts")
-    if not isinstance(posts, list):
-        return payload
-
-    user_map = _build_user_map(payload)
+def _filter_posts_by_opt_out(
+    posts: list, user_map: dict, filtered_users: set, removed_post_ids: set
+) -> list:
+    """Filter posts by user opt-out status. Returns kept posts and updates sets."""
     kept_posts = []
-    filtered_users: set[str] = set()
-    removed_post_ids: set[str] = set()
-
     for post in posts:
         if not isinstance(post, dict):
             continue
@@ -372,40 +479,87 @@ def _filter_posts_payload(payload: Any) -> Any:
             continue
 
         kept_posts.append(post)
+    return kept_posts
 
+
+def _clean_related_content(payload: dict, removed_post_ids: set) -> None:
+    """Remove comments and attachments related to filtered posts."""
+    comments = payload.get("comments")
+    if isinstance(comments, list):
+        payload["comments"] = [
+            comment
+            for comment in comments
+            if isinstance(comment, dict)
+            and comment.get("postId") not in removed_post_ids
+        ]
+
+    attachments = payload.get("attachments")
+    if isinstance(attachments, list):
+        payload["attachments"] = [
+            attachment
+            for attachment in attachments
+            if isinstance(attachment, dict)
+            and attachment.get("postId") not in removed_post_ids
+        ]
+
+
+def _clean_timelines(payload: dict, removed_post_ids: set) -> None:
+    """Remove filtered post IDs from timeline references."""
+    timelines = payload.get("timelines")
+    if isinstance(timelines, dict) and isinstance(timelines.get("posts"), list):
+        timelines["posts"] = [
+            post_id for post_id in timelines["posts"] if post_id not in removed_post_ids
+        ]
+
+
+def _filter_posts_payload(payload: Any) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    config = _load_opt_out_config()
+    if not config["enabled"]:
+        return payload
+
+    posts = payload.get("posts")
+    if not isinstance(posts, list):
+        return payload
+
+    user_map = _build_user_map(payload)
+    filtered_users: set[str] = set()
+    removed_post_ids: set[str] = set()
+
+    kept_posts = _filter_posts_by_opt_out(
+        posts, user_map, filtered_users, removed_post_ids
+    )
     payload["posts"] = kept_posts
 
     if removed_post_ids:
-        timelines = payload.get("timelines")
-        if isinstance(timelines, dict) and isinstance(timelines.get("posts"), list):
-            timelines["posts"] = [
-                post_id
-                for post_id in timelines["posts"]
-                if post_id not in removed_post_ids
-            ]
-
-        comments = payload.get("comments")
-        if isinstance(comments, list):
-            payload["comments"] = [
-                comment
-                for comment in comments
-                if isinstance(comment, dict)
-                and comment.get("postId") not in removed_post_ids
-            ]
-
-        attachments = payload.get("attachments")
-        if isinstance(attachments, list):
-            payload["attachments"] = [
-                attachment
-                for attachment in attachments
-                if isinstance(attachment, dict)
-                and attachment.get("postId") not in removed_post_ids
-            ]
-
+        _clean_timelines(payload, removed_post_ids)
+        _clean_related_content(payload, removed_post_ids)
         payload["filtered_users"] = sorted(filtered_users)
         payload["filter_reason"] = FILTER_REASON
 
     return payload
+
+
+def _summarize_tool_args(arguments: Any) -> Any:
+    if not isinstance(arguments, dict):
+        return arguments
+
+    redacted_keys = {"password", "auth_token", "token", "data"}
+    summarized: dict[str, Any] = {}
+
+    for key, value in arguments.items():
+        if key in redacted_keys:
+            summarized[key] = "<redacted>"
+        elif isinstance(value, list):
+            summarized[key] = f"list({len(value)})"
+        elif isinstance(value, dict):
+            summarized[key] = "{...}"
+        else:
+            summarized[key] = value
+
+    return summarized
 
 
 # Tool definitions
@@ -421,14 +575,21 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Get timeline feed from FreeFeed. Can get home feed, user posts, "
                 "user likes, user comments, or discussions feed. "
-                "Timeline types: 'home', 'posts', 'likes', 'comments', 'discussions'"
+                "Timeline types: 'home', 'posts', 'likes', 'comments', 'discussions', 'directs'"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "timeline_type": {
                         "type": "string",
-                        "enum": ["home", "posts", "likes", "comments", "discussions"],
+                        "enum": [
+                            "home",
+                            "posts",
+                            "likes",
+                            "comments",
+                            "discussions",
+                            "directs",
+                        ],
                         "description": "Type of timeline to retrieve",
                         "default": "home",
                     },
@@ -438,17 +599,37 @@ async def list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Number of posts to return",
+                        "description": LIMIT_DESCRIPTION,
                         "minimum": 1,
                         "maximum": 100,
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Offset for pagination",
+                        "description": OFFSET_DESCRIPTION,
                         "minimum": 0,
                     },
                 },
                 "required": ["timeline_type"],
+            },
+        ),
+        Tool(
+            name="get_directs",
+            description="Get direct posts timeline for current user",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": LIMIT_DESCRIPTION,
+                        "minimum": 1,
+                        "maximum": 100,
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": OFFSET_DESCRIPTION,
+                        "minimum": 0,
+                    },
+                },
             },
         ),
         # Post tools
@@ -491,6 +672,30 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="create_direct_post",
+            description="Create a direct post to one or more recipients",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "body": {
+                        "type": "string",
+                        "description": "Post text content",
+                    },
+                    "recipients": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of recipient usernames",
+                    },
+                    "attachment_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of file paths to attach (will be uploaded automatically)",
+                    },
+                },
+                "required": ["body", "recipients"],
+            },
+        ),
+        Tool(
             name="update_post",
             description="Update an existing post",
             inputSchema={
@@ -517,6 +722,20 @@ async def list_tools() -> list[Tool]:
                     "post_id": {
                         "type": "string",
                         "description": "Post ID to delete",
+                    },
+                },
+                "required": ["post_id"],
+            },
+        ),
+        Tool(
+            name="leave_direct",
+            description="Leave a direct post thread",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "post_id": {
+                        "type": "string",
+                        "description": "Post ID to leave",
                     },
                 },
                 "required": ["post_id"],
@@ -737,7 +956,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Offset for pagination",
+                        "description": OFFSET_DESCRIPTION,
                         "minimum": 0,
                     },
                 },
@@ -856,7 +1075,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Offset for pagination",
+                        "description": OFFSET_DESCRIPTION,
                         "minimum": 0,
                     },
                 },
@@ -880,320 +1099,459 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+async def _handle_tool_timeline(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_timeline tool."""
+    result = await client.get_timeline(
+        username=arguments.get("username"),
+        timeline_type=arguments.get("timeline_type", "home"),
+        limit=arguments.get("limit"),
+        offset=arguments.get("offset"),
+    )
+    return _filter_posts_payload(result)
+
+
+async def _handle_tool_directs(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_directs tool."""
+    result = await client.get_directs(
+        limit=arguments.get("limit"),
+        offset=arguments.get("offset"),
+    )
+    return _filter_posts_payload(result)
+
+
+async def _handle_tool_get_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_post tool."""
+    result = await client.get_post(arguments["post_id"])
+    user_map = _build_user_map(result)
+    post = result.get("posts") if isinstance(result, dict) else None
+    if isinstance(post, dict):
+        author_id = post.get("createdBy")
+        user_profile = user_map.get(author_id, {})
+        username = (
+            user_profile.get("username") if isinstance(user_profile, dict) else None
+        )
+        if username and should_skip_user(username, user_profile):
+            result = {
+                "error": "Post author opted out of AI interactions",
+                "filtered_users": [username],
+                "filter_reason": FILTER_REASON,
+            }
+    return result
+
+
+async def _handle_tool_create_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle create_post tool."""
+    attachment_paths = arguments.get("attachment_paths")
+    group_names = arguments.get("group_names")
+    return await client.create_post(
+        body=arguments["body"],
+        attachment_files=attachment_paths if attachment_paths else None,
+        group_names=group_names if group_names else None,
+    )
+
+
+async def _handle_tool_create_direct_post(
+    client: FreeFeedClient, arguments: Any
+) -> Any:
+    """Handle create_direct_post tool."""
+    recipients = arguments.get("recipients")
+    if not isinstance(recipients, list) or not recipients:
+        raise FreeFeedAPIError("Recipients list cannot be empty")
+    attachment_paths = arguments.get("attachment_paths")
+    return await client.create_direct_post(
+        body=arguments["body"],
+        recipients=recipients,
+        attachment_files=attachment_paths if attachment_paths else None,
+    )
+
+
+async def _handle_tool_update_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle update_post tool."""
+    return await client.update_post(
+        post_id=arguments["post_id"],
+        body=arguments["body"],
+    )
+
+
+async def _handle_tool_delete_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle delete_post tool."""
+    return await client.delete_post(arguments["post_id"])
+
+
+async def _handle_tool_leave_direct(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle leave_direct tool."""
+    return await client.leave_direct(arguments["post_id"])
+
+
+async def _handle_tool_like_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle like_post tool."""
+    return await client.like_post(arguments["post_id"])
+
+
+async def _handle_tool_unlike_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle unlike_post tool."""
+    return await client.unlike_post(arguments["post_id"])
+
+
+async def _handle_tool_hide_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle hide_post tool."""
+    return await client.hide_post(arguments["post_id"])
+
+
+async def _handle_tool_unhide_post(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle unhide_post tool."""
+    return await client.unhide_post(arguments["post_id"])
+
+
+async def _handle_tool_upload_attachment(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle upload_attachment tool."""
+    return await client.upload_attachment(
+        file_path=arguments["file_path"],
+    )
+
+
+async def _handle_tool_download_attachment(
+    client: FreeFeedClient, arguments: Any
+) -> tuple[Any, list[TextContent | ImageContent] | None]:
+    """Handle download_attachment tool. Returns (result, early_return) tuple."""
+    save_path = arguments.get("save_path")
+    prefer_image = arguments.get("prefer_image", True)
+    max_bytes = arguments.get("max_bytes")
+    if not isinstance(max_bytes, int) or max_bytes <= 0:
+        max_bytes = _resolve_image_max_bytes()
+
+    if save_path:
+        saved_path = await client.download_attachment(
+            attachment_url=arguments["attachment_url"],
+            save_path=save_path,
+        )
+        return {
+            "success": True,
+            "saved_to": str(saved_path),
+            "message": f"Attachment downloaded to {saved_path}",
+        }, None
+
+    attachment_url = arguments["attachment_url"]
+    file_data, content_type, size, error = await _fetch_attachment_data(
+        client, attachment_url, max_bytes
+    )
+
+    if error == "too_large":
+        return {
+            "success": False,
+            "message": "Attachment is too large for inline data",
+            "url": attachment_url,
+            "max_bytes": max_bytes,
+            "size": size,
+            "content_type": content_type,
+        }, None
+
+    if error:
+        return {
+            "success": False,
+            "message": "Attachment could not be fetched",
+            "url": attachment_url,
+            "error": error,
+            "content_type": content_type,
+        }, None
+
+    if prefer_image and content_type and content_type.startswith("image/"):
+        image_content = ImageContent(
+            type="image",
+            data=base64.b64encode(file_data or b"").decode("utf-8"),
+            mimeType=content_type,
+        )
+        text_content = TextContent(
+            type="text",
+            text=json.dumps(
+                {
+                    "success": True,
+                    "message": "Attachment returned as image content",
+                    "url": attachment_url,
+                    "size": size,
+                    "content_type": content_type,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
+        return None, [image_content, text_content]
+
+    return {
+        "success": True,
+        "data": base64.b64encode(file_data or b"").decode("utf-8"),
+        "size": size,
+        "message": "Attachment downloaded as base64 data",
+        "content_type": content_type,
+        "url": attachment_url,
+    }, None
+
+
+async def _handle_tool_get_attachment_image(
+    client: FreeFeedClient, arguments: Any
+) -> tuple[Any, list[TextContent | ImageContent] | None]:
+    """Handle get_attachment_image tool. Returns (result, early_return) tuple."""
+    attachment_url = arguments["attachment_url"]
+    max_bytes = arguments.get("max_bytes")
+    if not isinstance(max_bytes, int) or max_bytes <= 0:
+        max_bytes = _resolve_image_max_bytes()
+
+    file_data, content_type, size, error = await _fetch_attachment_data(
+        client, attachment_url, max_bytes
+    )
+
+    if error == "too_large":
+        return {
+            "success": False,
+            "message": "Attachment is too large for inline image data",
+            "url": attachment_url,
+            "max_bytes": max_bytes,
+            "size": size,
+            "content_type": content_type,
+        }, None
+
+    if error:
+        return {
+            "success": False,
+            "message": "Attachment could not be fetched",
+            "url": attachment_url,
+            "error": error,
+            "content_type": content_type,
+        }, None
+
+    if not content_type or not content_type.startswith("image/"):
+        return {
+            "success": False,
+            "message": "Attachment is not an image",
+            "url": attachment_url,
+            "size": size,
+            "content_type": content_type,
+        }, None
+
+    image_content = ImageContent(
+        type="image",
+        data=base64.b64encode(file_data or b"").decode("utf-8"),
+        mimeType=content_type,
+    )
+    text_content = TextContent(
+        type="text",
+        text=json.dumps(
+            {
+                "success": True,
+                "message": "Attachment returned as image content",
+                "url": attachment_url,
+                "size": size,
+                "content_type": content_type,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+    )
+    return None, [image_content, text_content]
+
+
+async def _handle_tool_get_post_attachments(
+    client: FreeFeedClient, arguments: Any
+) -> tuple[Any, list[TextContent | ImageContent] | None]:
+    """Handle get_post_attachments tool. Returns (result, early_return) tuple."""
+    post_data = await client.get_post(arguments["post_id"])
+    user_map = _build_user_map(post_data)
+    post = post_data.get("posts") if isinstance(post_data, dict) else None
+
+    if isinstance(post, dict):
+        author_id = post.get("createdBy")
+        user_profile = user_map.get(author_id, {})
+        username = (
+            user_profile.get("username") if isinstance(user_profile, dict) else None
+        )
+        if username and should_skip_user(username, user_profile):
+            result = {
+                "error": "Post author opted out of AI interactions",
+                "filtered_users": [username],
+                "filter_reason": FILTER_REASON,
+            }
+            result = _add_post_urls(result, client.base_url)
+            return None, [
+                TextContent(
+                    type="text",
+                    text=json.dumps(result, indent=2, ensure_ascii=False),
+                )
+            ]
+
+    attachments = []
+    if "attachments" in post_data:
+        att_list = post_data["attachments"]
+        if isinstance(att_list, dict):
+            att_list = [att_list]
+
+        for att in att_list:
+            attachment_info = {
+                "id": att.get("id"),
+                "fileName": att.get("fileName"),
+                "fileSize": att.get("fileSize"),
+                "mediaType": att.get("mediaType"),
+                "url": client.get_attachment_url(att, "original"),
+                "thumbnailUrl": client.get_attachment_url(att, "thumbnail"),
+                "imageSizes": att.get("imageSizes", {}),
+            }
+            attachment_info = {
+                k: v for k, v in attachment_info.items() if v is not None
+            }
+            attachments.append(attachment_info)
+
+    return {
+        "post_id": arguments["post_id"],
+        "attachments": attachments,
+        "count": len(attachments),
+    }, None
+
+
+async def _handle_tool_add_comment(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle add_comment tool."""
+    return await client.add_comment(
+        post_id=arguments["post_id"],
+        body=arguments["body"],
+    )
+
+
+async def _handle_tool_update_comment(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle update_comment tool."""
+    return await client.update_comment(
+        comment_id=arguments["comment_id"],
+        body=arguments["body"],
+    )
+
+
+async def _handle_tool_delete_comment(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle delete_comment tool."""
+    return await client.delete_comment(arguments["comment_id"])
+
+
+async def _handle_tool_search_posts(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle search_posts tool."""
+    result = await client.search_posts(
+        query=arguments["query"],
+        limit=arguments.get("limit"),
+        offset=arguments.get("offset"),
+    )
+    return _filter_posts_payload(result)
+
+
+async def _handle_tool_get_user_profile(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_user_profile tool."""
+    return await client.get_user_profile(arguments["username"])
+
+
+async def _handle_tool_whoami(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle whoami tool."""
+    result = await client.whoami()
+    if arguments.get("compact"):
+        result = _compact_whoami(result)
+    return result
+
+
+async def _handle_tool_get_subscribers(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_subscribers tool."""
+    return await client.get_subscribers(arguments["username"])
+
+
+async def _handle_tool_get_subscriptions(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_subscriptions tool."""
+    return await client.get_subscriptions(arguments["username"])
+
+
+async def _handle_tool_subscribe_user(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle subscribe_user tool."""
+    return await client.subscribe_user(arguments["username"])
+
+
+async def _handle_tool_unsubscribe_user(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle unsubscribe_user tool."""
+    return await client.unsubscribe_user(arguments["username"])
+
+
+async def _handle_tool_get_my_groups(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_my_groups tool."""
+    return await client.get_my_groups()
+
+
+async def _handle_tool_get_group_timeline(
+    client: FreeFeedClient, arguments: Any
+) -> Any:
+    """Handle get_group_timeline tool."""
+    result = await client.get_group_timeline(
+        group_name=arguments["group_name"],
+        limit=arguments.get("limit"),
+        offset=arguments.get("offset"),
+    )
+    return _filter_posts_payload(result)
+
+
+async def _handle_tool_get_group_info(client: FreeFeedClient, arguments: Any) -> Any:
+    """Handle get_group_info tool."""
+    return await client.get_group_info(arguments["group_name"])
+
+
+# Tool handler dispatch map
+_TOOL_HANDLERS = {
+    "get_timeline": _handle_tool_timeline,
+    "get_directs": _handle_tool_directs,
+    "get_post": _handle_tool_get_post,
+    "create_post": _handle_tool_create_post,
+    "create_direct_post": _handle_tool_create_direct_post,
+    "update_post": _handle_tool_update_post,
+    "delete_post": _handle_tool_delete_post,
+    "leave_direct": _handle_tool_leave_direct,
+    "like_post": _handle_tool_like_post,
+    "unlike_post": _handle_tool_unlike_post,
+    "hide_post": _handle_tool_hide_post,
+    "unhide_post": _handle_tool_unhide_post,
+    "upload_attachment": _handle_tool_upload_attachment,
+    "download_attachment": _handle_tool_download_attachment,
+    "get_attachment_image": _handle_tool_get_attachment_image,
+    "get_post_attachments": _handle_tool_get_post_attachments,
+    "add_comment": _handle_tool_add_comment,
+    "update_comment": _handle_tool_update_comment,
+    "delete_comment": _handle_tool_delete_comment,
+    "search_posts": _handle_tool_search_posts,
+    "get_user_profile": _handle_tool_get_user_profile,
+    "whoami": _handle_tool_whoami,
+    "get_subscribers": _handle_tool_get_subscribers,
+    "get_subscriptions": _handle_tool_get_subscriptions,
+    "subscribe_user": _handle_tool_subscribe_user,
+    "unsubscribe_user": _handle_tool_unsubscribe_user,
+    "get_my_groups": _handle_tool_get_my_groups,
+    "get_group_timeline": _handle_tool_get_group_timeline,
+    "get_group_info": _handle_tool_get_group_info,
+}
+
+
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageContent]:
     """Handle tool calls."""
     try:
+        logger.info("MCP tool call: %s args=%s", name, _summarize_tool_args(arguments))
+        start_time = time.monotonic()
         client = await get_client()
 
-        # Timeline tools
-        if name == "get_timeline":
-            result = await client.get_timeline(
-                username=arguments.get("username"),
-                timeline_type=arguments.get("timeline_type", "home"),
-                limit=arguments.get("limit"),
-                offset=arguments.get("offset"),
-            )
-            result = _filter_posts_payload(result)
-
-        # Post tools
-        elif name == "get_post":
-            result = await client.get_post(arguments["post_id"])
-            user_map = _build_user_map(result)
-            post = result.get("posts") if isinstance(result, dict) else None
-            if isinstance(post, dict):
-                author_id = post.get("createdBy")
-                user_profile = user_map.get(author_id, {})
-                username = (
-                    user_profile.get("username")
-                    if isinstance(user_profile, dict)
-                    else None
-                )
-                if username and should_skip_user(username, user_profile):
-                    result = {
-                        "error": "Post author opted out of AI interactions",
-                        "filtered_users": [username],
-                        "filter_reason": FILTER_REASON,
-                    }
-
-        elif name == "create_post":
-            attachment_paths = arguments.get("attachment_paths")
-            group_names = arguments.get("group_names")
-            result = await client.create_post(
-                body=arguments["body"],
-                attachment_files=attachment_paths if attachment_paths else None,
-                group_names=group_names if group_names else None,
-            )
-
-        elif name == "update_post":
-            result = await client.update_post(
-                post_id=arguments["post_id"],
-                body=arguments["body"],
-            )
-
-        elif name == "delete_post":
-            result = await client.delete_post(arguments["post_id"])
-
-        elif name == "like_post":
-            result = await client.like_post(arguments["post_id"])
-
-        elif name == "unlike_post":
-            result = await client.unlike_post(arguments["post_id"])
-
-        elif name == "hide_post":
-            result = await client.hide_post(arguments["post_id"])
-
-        elif name == "unhide_post":
-            result = await client.unhide_post(arguments["post_id"])
-
-        # Attachment tools
-        elif name == "upload_attachment":
-            result = await client.upload_attachment(
-                file_path=arguments["file_path"],
-            )
-
-        elif name == "download_attachment":
-            save_path = arguments.get("save_path")
-            prefer_image = arguments.get("prefer_image", True)
-            max_bytes = arguments.get("max_bytes")
-            if not isinstance(max_bytes, int) or max_bytes <= 0:
-                max_bytes = _resolve_image_max_bytes()
-
-            if save_path:
-                # Download and save to file
-                saved_path = await client.download_attachment(
-                    attachment_url=arguments["attachment_url"],
-                    save_path=save_path,
-                )
-                result = {
-                    "success": True,
-                    "saved_to": str(saved_path),
-                    "message": f"Attachment downloaded to {saved_path}",
-                }
-            else:
-                attachment_url = arguments["attachment_url"]
-                file_data, content_type, size, error = await _fetch_attachment_data(
-                    client, attachment_url, max_bytes
-                )
-                if error == "too_large":
-                    result = {
-                        "success": False,
-                        "message": "Attachment is too large for inline data",
-                        "url": attachment_url,
-                        "max_bytes": max_bytes,
-                        "size": size,
-                        "content_type": content_type,
-                    }
-                elif (
-                    prefer_image and content_type and content_type.startswith("image/")
-                ):
-                    image_content = ImageContent(
-                        type="image",
-                        data=base64.b64encode(file_data or b"").decode("utf-8"),
-                        mimeType=content_type,
-                    )
-                    text_content = TextContent(
-                        type="text",
-                        text=json.dumps(
-                            {
-                                "success": True,
-                                "message": "Attachment returned as image content",
-                                "url": attachment_url,
-                                "size": size,
-                                "content_type": content_type,
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                    )
-                    return [image_content, text_content]
-                else:
-                    result = {
-                        "success": True,
-                        "data": base64.b64encode(file_data or b"").decode("utf-8"),
-                        "size": size,
-                        "message": "Attachment downloaded as base64 data",
-                        "content_type": content_type,
-                        "url": attachment_url,
-                    }
-
-        elif name == "get_attachment_image":
-            attachment_url = arguments["attachment_url"]
-            max_bytes = arguments.get("max_bytes")
-            if not isinstance(max_bytes, int) or max_bytes <= 0:
-                max_bytes = _resolve_image_max_bytes()
-
-            file_data, content_type, size, error = await _fetch_attachment_data(
-                client, attachment_url, max_bytes
-            )
-            if error == "too_large":
-                result = {
-                    "success": False,
-                    "message": "Attachment is too large for inline image data",
-                    "url": attachment_url,
-                    "max_bytes": max_bytes,
-                    "size": size,
-                    "content_type": content_type,
-                }
-            elif not content_type or not content_type.startswith("image/"):
-                result = {
-                    "success": False,
-                    "message": "Attachment is not an image",
-                    "url": attachment_url,
-                    "size": size,
-                    "content_type": content_type,
-                }
-            else:
-                image_content = ImageContent(
-                    type="image",
-                    data=base64.b64encode(file_data or b"").decode("utf-8"),
-                    mimeType=content_type,
-                )
-                text_content = TextContent(
-                    type="text",
-                    text=json.dumps(
-                        {
-                            "success": True,
-                            "message": "Attachment returned as image content",
-                            "url": attachment_url,
-                            "size": size,
-                            "content_type": content_type,
-                        },
-                        indent=2,
-                        ensure_ascii=False,
-                    ),
-                )
-                return [image_content, text_content]
-
-        elif name == "get_post_attachments":
-            # Get the post first
-            post_data = await client.get_post(arguments["post_id"])
-
-            user_map = _build_user_map(post_data)
-            post = post_data.get("posts") if isinstance(post_data, dict) else None
-            if isinstance(post, dict):
-                author_id = post.get("createdBy")
-                user_profile = user_map.get(author_id, {})
-                username = (
-                    user_profile.get("username")
-                    if isinstance(user_profile, dict)
-                    else None
-                )
-                if username and should_skip_user(username, user_profile):
-                    result = {
-                        "error": "Post author opted out of AI interactions",
-                        "filtered_users": [username],
-                        "filter_reason": FILTER_REASON,
-                    }
-                    result = _add_post_urls(result, client.base_url)
-                    import json
-
-                    return [
-                        TextContent(
-                            type="text",
-                            text=json.dumps(result, indent=2, ensure_ascii=False),
-                        )
-                    ]
-
-            # Extract attachments
-            attachments = []
-
-            # Check if post has attachments
-            if "attachments" in post_data:
-                att_list = post_data["attachments"]
-                if isinstance(att_list, dict):
-                    att_list = [att_list]
-
-                for att in att_list:
-                    attachment_info = {
-                        "id": att.get("id"),
-                        "fileName": att.get("fileName"),
-                        "fileSize": att.get("fileSize"),
-                        "mediaType": att.get("mediaType"),
-                        "url": client.get_attachment_url(att, "original"),
-                        "thumbnailUrl": client.get_attachment_url(att, "thumbnail"),
-                        "imageSizes": att.get("imageSizes", {}),
-                    }
-                    # Remove None values
-                    attachment_info = {
-                        k: v for k, v in attachment_info.items() if v is not None
-                    }
-                    attachments.append(attachment_info)
-
-            result = {
-                "post_id": arguments["post_id"],
-                "attachments": attachments,
-                "count": len(attachments),
-            }
-
-        # Comment tools
-        elif name == "add_comment":
-            result = await client.add_comment(
-                post_id=arguments["post_id"],
-                body=arguments["body"],
-            )
-
-        elif name == "update_comment":
-            result = await client.update_comment(
-                comment_id=arguments["comment_id"],
-                body=arguments["body"],
-            )
-
-        elif name == "delete_comment":
-            result = await client.delete_comment(arguments["comment_id"])
-
-        # Search tools
-        elif name == "search_posts":
-            result = await client.search_posts(
-                query=arguments["query"],
-                limit=arguments.get("limit"),
-                offset=arguments.get("offset"),
-            )
-            result = _filter_posts_payload(result)
-
-        # User tools
-        elif name == "get_user_profile":
-            result = await client.get_user_profile(arguments["username"])
-
-        elif name == "whoami":
-            result = await client.whoami()
-            if arguments.get("compact"):
-                result = _compact_whoami(result)
-
-        elif name == "get_subscribers":
-            result = await client.get_subscribers(arguments["username"])
-
-        elif name == "get_subscriptions":
-            result = await client.get_subscriptions(arguments["username"])
-
-        elif name == "subscribe_user":
-            result = await client.subscribe_user(arguments["username"])
-
-        elif name == "unsubscribe_user":
-            result = await client.unsubscribe_user(arguments["username"])
-
-        # Group tools
-        elif name == "get_my_groups":
-            result = await client.get_my_groups()
-
-        elif name == "get_group_timeline":
-            result = await client.get_group_timeline(
-                group_name=arguments["group_name"],
-                limit=arguments.get("limit"),
-                offset=arguments.get("offset"),
-            )
-
-        elif name == "get_group_info":
-            result = await client.get_group_info(arguments["group_name"])
-
-        else:
+        if name not in _TOOL_HANDLERS:
             raise ValueError(f"Unknown tool: {name}")
 
+        handler = _TOOL_HANDLERS[name]
+        result = await handler(client, arguments)
+
+        # Check if handler returned early with content
+        if isinstance(result, tuple) and len(result) == 2:
+            result_dict, early_return = result
+            if early_return is not None:
+                elapsed_ms = (time.monotonic() - start_time) * 1000
+                logger.info(MCP_TOOL_SUCCESS_LOG, name, elapsed_ms)
+                return early_return
+            result = result_dict
+
         result = _add_post_urls(result, client.base_url)
-
-        # Format result as JSON string
-        import json
-
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+        logger.info(MCP_TOOL_SUCCESS_LOG, name, elapsed_ms)
         return [
             TextContent(
                 type="text", text=json.dumps(result, indent=2, ensure_ascii=False)
@@ -1201,10 +1559,24 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
         ]
 
     except FreeFeedAPIError as e:
-        logger.error(f"FreeFeed API error in {name}: {e}")
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+        logger.error("FreeFeed API error in %s: %s", name, e)
+        logger.warning(
+            "MCP tool error: %s duration_ms=%.1f error=%s",
+            name,
+            elapsed_ms,
+            e,
+        )
         return [TextContent(type="text", text=f"Error: {str(e)}")]
     except Exception as e:
-        logger.error(f"Unexpected error in {name}: {e}", exc_info=True)
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+        logger.error(
+            "Unexpected error in %s duration_ms=%.1f error=%s",
+            name,
+            elapsed_ms,
+            e,
+            exc_info=True,
+        )
         return [TextContent(type="text", text=f"Unexpected error: {str(e)}")]
 
 

@@ -145,6 +145,9 @@ curl "http://localhost:8000/api/timeline?timeline_type=posts&username=someuser&l
 
 # User likes
 curl "http://localhost:8000/api/timeline?timeline_type=likes&username=someuser"
+
+# Directs (private messages)
+curl "http://localhost:8000/api/directs?limit=20"
 ```
 
 ### Posts
@@ -157,6 +160,11 @@ curl http://localhost:8000/api/posts/POST_ID
 curl -X POST http://localhost:8000/api/posts \
   -F "body=Hello, FreeFeed!" \
   -F "group_names=mygroup,anothergroup"
+
+# Create a direct post
+curl -X POST http://localhost:8000/api/directs \
+  -H "Content-Type: application/json" \
+  -d '{"body":"Hello in direct!","recipients":["alice","bob"]}'
 
 # Create a post with an image
 curl -X POST http://localhost:8000/api/posts \
@@ -177,6 +185,9 @@ curl -X PUT http://localhost:8000/api/posts/POST_ID \
 
 # Delete a post
 curl -X DELETE http://localhost:8000/api/posts/POST_ID
+
+# Leave a direct thread
+curl -X POST http://localhost:8000/api/posts/POST_ID/leave
 
 # Like a post
 curl -X POST http://localhost:8000/api/posts/POST_ID/like

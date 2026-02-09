@@ -10,6 +10,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Constants
+_JSON_CONTENT_TYPE = "application/json"
+
 
 def _resolve_log_level() -> int:
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -49,6 +52,7 @@ def _configure_client_logger() -> None:
     )
     file_handler.setLevel(_resolve_log_level())
     logger.addHandler(file_handler)
+    logger.setLevel(_resolve_log_level())
 
 
 _configure_client_logger()
@@ -113,7 +117,7 @@ class FreeFeedClient:
             },
         )
 
-    async def _log_request(self, request: httpx.Request) -> None:
+    def _log_request(self, request: httpx.Request) -> None:
         """Log outgoing requests in DEBUG mode."""
         if not logger.isEnabledFor(logging.DEBUG):
             return
@@ -131,7 +135,7 @@ class FreeFeedClient:
             headers,
         )
 
-    async def _log_response(self, response: httpx.Response) -> None:
+    def _log_response(self, response: httpx.Response) -> None:
         """Log incoming responses in DEBUG mode."""
         if not logger.isEnabledFor(logging.DEBUG):
             return
@@ -160,8 +164,8 @@ class FreeFeedClient:
     def _get_headers(self) -> Dict[str, str]:
         """Get request headers with auth token if available."""
         headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Content-Type": _JSON_CONTENT_TYPE,
+            "Accept": _JSON_CONTENT_TYPE,
         }
         if self.auth_token:
             headers["X-Authentication-Token"] = self.auth_token
@@ -192,7 +196,7 @@ class FreeFeedClient:
 
         try:
             response = await self.client.post(
-                url, json=data, headers={"Content-Type": "application/json"}
+                url, json=data, headers={"Content-Type": _JSON_CONTENT_TYPE}
             )
             response.raise_for_status()
             result = response.json()
@@ -228,7 +232,7 @@ class FreeFeedClient:
 
         Args:
             username: Username (None for home timeline)
-            timeline_type: Type of timeline (posts, likes, comments, home, discussions)
+            timeline_type: Type of timeline (posts, likes, comments, home, discussions, directs)
             limit: Number of posts to return
             offset: Offset for pagination
 
@@ -239,6 +243,8 @@ class FreeFeedClient:
             url = self._api_url("timelines/home")
         elif timeline_type == "discussions":
             url = self._api_url("timelines/filter/discussions")
+        elif timeline_type == "directs":
+            url = self._api_url("timelines/filter/directs")
         elif username:
             if timeline_type == "posts":
                 url = self._api_url(f"timelines/{username}")
@@ -265,7 +271,84 @@ class FreeFeedClient:
         response.raise_for_status()
         return response.json()
 
+    async def get_directs(
+        self,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get direct posts timeline for current user."""
+        return await self.get_timeline(
+            timeline_type="directs",
+            limit=limit,
+            offset=offset,
+        )
+
     # Attachment methods
+
+    def _resolve_filename(
+        self, file_path: Union[str, Path], filename: Optional[str]
+    ) -> str:
+        """Resolve the filename from path or override.
+
+        Args:
+            file_path: Path to the file
+            filename: Override filename (optional)
+
+        Returns:
+            Resolved filename
+        """
+        if filename is not None:
+            return filename
+
+        if isinstance(file_path, Path):
+            return file_path.name
+        return Path(file_path).name if file_path else "attachment"
+
+    def _resolve_mime_type(self, filename: str) -> str:
+        """Resolve MIME type for a filename.
+
+        Args:
+            filename: Filename to determine MIME type for
+
+        Returns:
+            MIME type string
+        """
+        mime_type, _ = mimetypes.guess_type(filename)
+        return mime_type or "application/octet-stream"
+
+    def _prepare_file_info(
+        self,
+        file_path: Union[str, Path],
+        file_data: Optional[bytes],
+        filename: Optional[str],
+    ) -> tuple[bytes, str, str]:
+        """Prepare file data, filename, and MIME type for upload.
+
+        Args:
+            file_path: Path to the file
+            file_data: Raw file bytes (optional)
+            filename: Override filename (optional)
+
+        Returns:
+            Tuple of (file_data, filename, mime_type)
+
+        Raises:
+            FreeFeedAPIError: If file not found
+        """
+        # Prepare file data
+        if file_data is None:
+            path = Path(file_path)
+            if not path.exists():
+                raise FreeFeedAPIError(f"File not found: {file_path}")
+            file_data = path.read_bytes()
+
+        # Resolve filename
+        resolved_filename = self._resolve_filename(file_path, filename)
+
+        # Determine MIME type
+        mime_type = self._resolve_mime_type(resolved_filename)
+
+        return file_data, resolved_filename, mime_type
 
     async def upload_attachment(
         self,
@@ -286,25 +369,9 @@ class FreeFeedClient:
         Raises:
             FreeFeedAPIError: If upload fails
         """
-        # Prepare file data
-        if file_data is None:
-            path = Path(file_path)
-            if not path.exists():
-                raise FreeFeedAPIError(f"File not found: {file_path}")
-            file_data = path.read_bytes()
-            if filename is None:
-                filename = path.name
-        else:
-            if filename is None:
-                if isinstance(file_path, Path):
-                    filename = file_path.name
-                else:
-                    filename = Path(file_path).name if file_path else "attachment"
-
-        # Determine MIME type
-        mime_type, _ = mimetypes.guess_type(filename)
-        if mime_type is None:
-            mime_type = "application/octet-stream"
+        file_data, filename, mime_type = self._prepare_file_info(
+            file_path, file_data, filename
+        )
 
         url = self._api_url("attachments")
 
@@ -410,6 +477,43 @@ class FreeFeedClient:
 
         return None
 
+    async def get_attachment_preview_url(
+        self,
+        attachment_id: str,
+        preview_type: str = "original",
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        image_format: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Get preview metadata for an attachment.
+
+        Args:
+            attachment_id: Attachment ID
+            preview_type: Preview type (original, image, video, audio)
+            width: Optional width for resized images
+            height: Optional height for resized images
+            image_format: Optional format (webp, jpeg, avif)
+
+        Returns:
+            Preview response with URL and mimeType
+        """
+        url = self._api_url(f"attachments/{attachment_id}/{preview_type}")
+        params: Dict[str, Any] = {}
+        if width is not None:
+            params["width"] = width
+        if height is not None:
+            params["height"] = height
+        if image_format:
+            params["format"] = image_format
+
+        response = await self.client.get(
+            url,
+            headers=self._get_headers(),
+            params=params if params else None,
+        )
+        response.raise_for_status()
+        return response.json()
+
     # Post methods
 
     async def get_post(self, post_id: str) -> Dict[str, Any]:
@@ -425,6 +529,66 @@ class FreeFeedClient:
         response = await self.client.get(url, headers=self._get_headers())
         response.raise_for_status()
         return response.json()
+
+    async def _upload_attachment_files(
+        self, attachment_files: List[Union[str, Path]]
+    ) -> List[str]:
+        """Upload attachment files and extract their IDs.
+
+        Args:
+            attachment_files: List of file paths to upload
+
+        Returns:
+            List of attachment IDs
+        """
+        attachment_ids = []
+        for file_path in attachment_files:
+            logger.info(f"Uploading attachment: {file_path}")
+            result = await self.upload_attachment(file_path)
+            attachment_id = self._extract_attachment_id(result)
+            if attachment_id:
+                attachment_ids.append(attachment_id)
+        return attachment_ids
+
+    def _extract_attachment_id(self, result: Dict[str, Any]) -> Optional[str]:
+        """Extract attachment ID from upload response.
+
+        Args:
+            result: Upload response
+
+        Returns:
+            Attachment ID or None
+        """
+        if "attachments" in result:
+            att = result["attachments"]
+            if isinstance(att, dict):
+                return att.get("id")
+            elif isinstance(att, list) and len(att) > 0:
+                return att[0].get("id")
+        elif "id" in result:
+            return result["id"]
+        return None
+
+    async def _resolve_feed_names(
+        self,
+        feeds: Optional[List[str]],
+        group_names: Optional[List[str]],
+    ) -> List[str]:
+        """Resolve feed names from feeds and group names.
+
+        Args:
+            feeds: List of feed IDs
+            group_names: List of group usernames
+
+        Returns:
+            List of feed names
+        """
+        feed_names = list(feeds) if feeds else []
+        if group_names:
+            feed_names.extend(group_names)
+        if not feed_names:
+            feed_names = [await self._get_default_feed_name()]
+        return feed_names
 
     async def create_post(
         self,
@@ -446,29 +610,13 @@ class FreeFeedClient:
         Returns:
             Created post data
         """
-        # Upload files if provided
         attachment_ids = list(attachments) if attachments else []
 
         if attachment_files:
-            for file_path in attachment_files:
-                logger.info(f"Uploading attachment: {file_path}")
-                result = await self.upload_attachment(file_path)
+            uploaded_ids = await self._upload_attachment_files(attachment_files)
+            attachment_ids.extend(uploaded_ids)
 
-                # Extract attachment ID from response
-                if "attachments" in result:
-                    att = result["attachments"]
-                    if isinstance(att, dict):
-                        attachment_ids.append(att.get("id"))
-                    elif isinstance(att, list) and len(att) > 0:
-                        attachment_ids.append(att[0].get("id"))
-                elif "id" in result:
-                    attachment_ids.append(result["id"])
-
-        feed_names = list(feeds) if feeds else []
-        if group_names:
-            feed_names.extend(group_names)
-        if not feed_names:
-            feed_names = [await self._get_default_feed_name()]
+        feed_names = await self._resolve_feed_names(feeds, group_names)
 
         url = self._api_url("posts")
         data = {
@@ -486,6 +634,49 @@ class FreeFeedClient:
         )
         response.raise_for_status()
         return response.json()
+
+    async def create_direct_post(
+        self,
+        body: str,
+        recipients: List[str],
+        attachments: Optional[List[str]] = None,
+        attachment_files: Optional[List[Union[str, Path]]] = None,
+    ) -> Dict[str, Any]:
+        """Create a direct post to one or more recipients.
+
+        Args:
+            body: Post text
+            recipients: List of usernames to receive the direct post
+            attachments: List of attachment IDs (already uploaded)
+            attachment_files: List of file paths to upload and attach
+
+        Returns:
+            Created post data
+        """
+        if not recipients:
+            raise FreeFeedAPIError("Direct post requires at least one recipient")
+
+        return await self.create_post(
+            body=body,
+            attachments=attachments,
+            attachment_files=attachment_files,
+            feeds=recipients,
+            group_names=None,
+        )
+
+    async def leave_direct(self, post_id: str) -> Dict[str, Any]:
+        """Leave a direct post thread.
+
+        Args:
+            post_id: Post ID
+
+        Returns:
+            Result payload
+        """
+        url = self._api_url(f"posts/{post_id}/leave")
+        response = await self.client.post(url, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json() if response.text else {"success": True}
 
     async def _get_default_feed_name(self) -> str:
         if self.username:
@@ -536,7 +727,6 @@ class FreeFeedClient:
 
     async def like_post(self, post_id: str) -> Dict[str, Any]:
         """Like a post.
-
         Args:
             post_id: Post ID
 
@@ -834,6 +1024,29 @@ class FreeFeedClient:
 
         return {"groups": groups, "count": len(groups)}
 
+    def _extract_posts_feed_id(self, group_info: Dict[str, Any]) -> Optional[str]:
+        """Extract Posts feed ID from group info.
+
+        Args:
+            group_info: Group information from API
+
+        Returns:
+            Posts feed ID or None
+        """
+        if "users" not in group_info:
+            return None
+
+        user_data = group_info["users"]
+        if not isinstance(user_data, dict):
+            return None
+
+        subscriptions = user_data.get("subscriptions", [])
+        for sub in subscriptions:
+            if sub.get("name") == "Posts":
+                return sub.get("id")
+
+        return None
+
     async def resolve_feed_ids(
         self,
         group_names: Optional[List[str]] = None,
@@ -853,18 +1066,9 @@ class FreeFeedClient:
         for group_name in group_names:
             try:
                 group_info = await self.get_group_info(group_name)
-
-                # Extract Posts feed ID from group
-                if "users" in group_info:
-                    user_data = group_info["users"]
-                    if isinstance(user_data, dict):
-                        # Find Posts feed
-                        subscriptions = user_data.get("subscriptions", [])
-                        for sub in subscriptions:
-                            if sub.get("name") == "Posts":
-                                feed_ids.append(sub.get("id"))
-                                break
-
+                feed_id = self._extract_posts_feed_id(group_info)
+                if feed_id:
+                    feed_ids.append(feed_id)
             except Exception as e:
                 logger.warning(f"Could not resolve group {group_name}: {e}")
                 continue

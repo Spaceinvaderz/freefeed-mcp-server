@@ -125,6 +125,47 @@ SESSION_STORE: dict[str, "SessionData"] = {}
 SESSION_LOCK = asyncio.Lock()
 
 
+def _parse_api_version(api_version_raw: Optional[str]) -> Optional[int]:
+    """Parse API version from environment variable."""
+    if not api_version_raw:
+        return None
+    try:
+        return int(api_version_raw)
+    except ValueError:
+        logger.warning(
+            "Invalid FREEFEED_API_VERSION=%s; using default", api_version_raw
+        )
+        return None
+
+
+async def _initialize_client(
+    base_url: str,
+    api_version: Optional[int],
+    app_token: Optional[str],
+    username: Optional[str],
+    password: Optional[str],
+) -> FreeFeedClient:
+    """Initialize and authenticate FreeFeed client."""
+    client = FreeFeedClient(
+        base_url=base_url,
+        username=username,
+        password=password,
+        auth_token=app_token,
+        api_version=api_version,
+    )
+
+    if app_token:
+        logger.info("FreeFeed client initialized with application token")
+    else:
+        try:
+            await client.authenticate()
+            logger.info("FreeFeed client initialized and authenticated")
+        except FreeFeedAuthError as e:
+            raise HTTPException(status_code=401, detail=str(e))
+
+    return client
+
+
 async def get_client() -> FreeFeedClient:
     """Get or create FreeFeed client instance."""
     global freefeed_client
@@ -136,14 +177,7 @@ async def get_client() -> FreeFeedClient:
         username = os.getenv("FREEFEED_USERNAME")
         password = os.getenv("FREEFEED_PASSWORD")
 
-        api_version: Optional[int] = None
-        if api_version_raw:
-            try:
-                api_version = int(api_version_raw)
-            except ValueError:
-                logger.warning(
-                    "Invalid FREEFEED_API_VERSION=%s; using default", api_version_raw
-                )
+        api_version = _parse_api_version(api_version_raw)
 
         if not app_token and (not username or not password):
             raise HTTPException(
@@ -151,22 +185,13 @@ async def get_client() -> FreeFeedClient:
                 detail="Set FREEFEED_APP_TOKEN or FREEFEED_USERNAME and FREEFEED_PASSWORD",
             )
 
-        freefeed_client = FreeFeedClient(
+        freefeed_client = await _initialize_client(
             base_url=base_url,
+            api_version=api_version,
+            app_token=app_token,
             username=username,
             password=password,
-            auth_token=app_token,
-            api_version=api_version,
         )
-
-        if app_token:
-            logger.info("FreeFeed client initialized with application token")
-        else:
-            try:
-                await freefeed_client.authenticate()
-                logger.info("FreeFeed client initialized and authenticated")
-            except FreeFeedAuthError as e:
-                raise HTTPException(status_code=401, detail=str(e))
 
     return freefeed_client
 
@@ -295,6 +320,11 @@ class CommentCreate(BaseModel):
     body: str
 
 
+class DirectCreate(BaseModel):
+    body: str
+    recipients: List[str]
+
+
 class TimelineParams(BaseModel):
     timeline_type: str = "home"
     username: Optional[str] = None
@@ -405,6 +435,23 @@ async def get_timeline(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/directs")
+async def get_directs(
+    limit: Optional[int] = None,
+    offset: Optional[int] = None,
+    request: Request = None,
+):
+    """Get direct posts timeline for current user."""
+    try:
+        client = await _get_client_for_request(request)
+        result = await client.get_directs(limit=limit, offset=offset)
+        return _add_post_urls(result, client.base_url)
+    except FreeFeedAPIError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Post endpoints
 
 
@@ -458,6 +505,28 @@ async def create_post(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/api/directs")
+async def create_direct_post(data: DirectCreate, request: Request = None):
+    """Create a direct post to one or more recipients."""
+    try:
+        if not data.recipients or not all(
+            isinstance(name, str) and name.strip() for name in data.recipients
+        ):
+            raise HTTPException(
+                status_code=400, detail="Recipients list must contain usernames"
+            )
+        client = await _get_client_for_request(request)
+        result = await client.create_direct_post(
+            body=data.body,
+            recipients=data.recipients,
+        )
+        return _add_post_urls(result, client.base_url)
+    except FreeFeedAPIError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.put("/api/posts/{post_id}")
 async def update_post(post_id: str, data: PostUpdate, request: Request):
     """Update a post."""
@@ -475,6 +544,17 @@ async def delete_post(post_id: str, request: Request):
     try:
         client = await _get_client_for_request(request)
         result = await client.delete_post(post_id)
+        return result
+    except FreeFeedAPIError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/posts/{post_id}/leave")
+async def leave_direct(post_id: str, request: Request):
+    """Leave a direct post thread."""
+    try:
+        client = await _get_client_for_request(request)
+        result = await client.leave_direct(post_id)
         return result
     except FreeFeedAPIError as e:
         raise HTTPException(status_code=400, detail=str(e))

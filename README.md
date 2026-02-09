@@ -6,6 +6,7 @@ MCP server for the FreeFeed API, a social network that replaces FriendFeed.
 
 ### Read
 - `get_timeline` - Get a user timeline or the home feed
+- `get_directs` - Get direct (private) posts timeline
 - `get_post` - Get a specific post with comments
 - `get_post_attachments` - Get attachment list with URLs
 - `search_posts` - Search posts with advanced operators
@@ -19,6 +20,8 @@ MCP server for the FreeFeed API, a social network that replaces FriendFeed.
 - `upload_attachment` - Upload files (images, video, etc.)
 - `download_attachment` - Download post attachments (returns image content when possible)
 - `get_attachment_image` - Download attachment as image content with URL fallback
+- `create_direct_post` - Send a direct post to one or more recipients
+- `leave_direct` - Leave a direct post thread
 - `create_post` - Create a new post (auto uploads files, supports posting to groups)
 - `update_post` - Edit a post
 - `delete_post` - Delete a post
@@ -42,7 +45,7 @@ The server automatically excludes:
 Opt-out filtering is disabled by default. Enable it with configuration:
 
 - `FREEFEED_OPTOUT_ENABLED=true`
-- `FREEFEED_OPTOUT_USERS=berkgaut,anotheruser`
+- `FREEFEED_OPTOUT_USERS=oneuser,anotheruser`
 - `FREEFEED_OPTOUT_TAGS=#noai,#opt-out-ai,#no-bots,#ai-free`
 - `FREEFEED_OPTOUT_RESPECT_PRIVATE=true`
 - `FREEFEED_OPTOUT_RESPECT_PAUSED=true`
@@ -118,6 +121,9 @@ Add to Claude Desktop config (`claude_desktop_config.json`):
     }
   }
 }
+
+Replace `/path/to/venv/bin/python` with your actual virtualenv path. On macOS it is often
+`./.venv/bin/python` if you created a local venv in the project directory.
 ```
 
 ### Claude Desktop integration (system Python)
@@ -158,10 +164,58 @@ Use the Python executable from your virtualenv:
     }
   }
 }
+
+### MCP tool examples
+
+```json
+{
+  "name": "get_directs",
+  "arguments": {
+    "limit": 20
+  }
+}
 ```
 
-Replace `/path/to/venv/bin/python` with your actual virtualenv path. On macOS it is often
-`./.venv/bin/python` if you created a local venv in the project directory.
+```json
+{
+  "name": "create_direct_post",
+  "arguments": {
+    "body": "Hi from MCP!",
+    "recipients": ["alice", "bob"]
+  }
+}
+```
+
+```json
+{
+  "name": "leave_direct",
+  "arguments": {
+    "post_id": "POST_ID"
+  }
+}
+```
+
+```json
+{
+  "name": "get_attachment_image",
+  "arguments": {
+    "attachment_url": "https://freefeed.net/attachments/ATTACHMENT_ID",
+    "max_bytes": 2000000
+  }
+}
+```
+
+```json
+{
+  "name": "download_attachment",
+  "arguments": {
+    "attachment_url": "https://freefeed.net/attachments/ATTACHMENT_ID",
+    "prefer_image": true,
+    "max_bytes": 2000000
+  }
+}
+```
+```
 
 ## Request examples
 

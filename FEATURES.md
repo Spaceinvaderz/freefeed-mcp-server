@@ -28,8 +28,10 @@
 - ✅ Create posts
 - ✅ Create posts with attachments
 - ✅ Create posts in groups
+- ✅ Create direct posts (directs)
 - ✅ Edit posts
 - ✅ Delete posts
+- ✅ Leave direct threads
 - ✅ Like/unlike
 - ✅ Hide/unhide posts
 
@@ -44,6 +46,7 @@
 - ✅ User likes (likes)
 - ✅ User comments (comments)
 - ✅ Discussions (discussions)
+- ✅ Directs (directs)
 - ✅ Group posts
 - ✅ Search with operators (intitle:, incomment:, from:, AND, OR)
 

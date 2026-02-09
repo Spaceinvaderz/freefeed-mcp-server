@@ -56,43 +56,35 @@ def _parse_bool(value: str | None) -> bool | None:
     return None
 
 
-def _load_opt_out_config() -> dict[str, Any]:
-    config: dict[str, Any] = {
-        "enabled": False,
-        "users": set(),
-        "tags": list(DEFAULT_OPT_OUT_TAGS),
-        "respect_private": True,
-        "respect_paused": True,
-    }
+def _load_config_from_file(config_path: str, config: dict[str, Any]) -> None:
+    """Load opt-out configuration from a JSON file."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = handle.read()
+        import json
 
-    config_path = os.getenv("FREEFEED_OPTOUT_CONFIG")
-    if config_path:
-        try:
-            with open(config_path, "r", encoding="utf-8") as handle:
-                data = handle.read()
-            import json
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            return
 
-            payload = json.loads(data)
-            if isinstance(payload, dict):
-                if isinstance(payload.get("enabled"), bool):
-                    config["enabled"] = payload["enabled"]
-                if isinstance(payload.get("manual_opt_out"), list):
-                    config["users"] = {
-                        str(u).strip()
-                        for u in payload["manual_opt_out"]
-                        if str(u).strip()
-                    }
-                if isinstance(payload.get("tags"), list):
-                    config["tags"] = [
-                        str(t).strip() for t in payload["tags"] if str(t).strip()
-                    ]
-                if isinstance(payload.get("respect_private"), bool):
-                    config["respect_private"] = payload["respect_private"]
-                if isinstance(payload.get("respect_paused"), bool):
-                    config["respect_paused"] = payload["respect_paused"]
-        except (OSError, ValueError) as exc:
-            logger.warning("Failed to read opt-out config %s: %s", config_path, exc)
+        if isinstance(payload.get("enabled"), bool):
+            config["enabled"] = payload["enabled"]
+        if isinstance(payload.get("manual_opt_out"), list):
+            config["users"] = {
+                str(u).strip() for u in payload["manual_opt_out"] if str(u).strip()
+            }
+        if isinstance(payload.get("tags"), list):
+            config["tags"] = [str(t).strip() for t in payload["tags"] if str(t).strip()]
+        if isinstance(payload.get("respect_private"), bool):
+            config["respect_private"] = payload["respect_private"]
+        if isinstance(payload.get("respect_paused"), bool):
+            config["respect_paused"] = payload["respect_paused"]
+    except (OSError, ValueError) as exc:
+        logger.warning("Failed to read opt-out config %s: %s", config_path, exc)
 
+
+def _load_config_from_env(config: dict[str, Any]) -> None:
+    """Load opt-out configuration from environment variables."""
     enabled_env = _parse_bool(os.getenv("FREEFEED_OPTOUT_ENABLED"))
     if enabled_env is not None:
         config["enabled"] = enabled_env
@@ -112,6 +104,22 @@ def _load_opt_out_config() -> dict[str, Any]:
     respect_paused_env = _parse_bool(os.getenv("FREEFEED_OPTOUT_RESPECT_PAUSED"))
     if respect_paused_env is not None:
         config["respect_paused"] = respect_paused_env
+
+
+def _load_opt_out_config() -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "enabled": False,
+        "users": set(),
+        "tags": list(DEFAULT_OPT_OUT_TAGS),
+        "respect_private": True,
+        "respect_paused": True,
+    }
+
+    config_path = os.getenv("FREEFEED_OPTOUT_CONFIG")
+    if config_path:
+        _load_config_from_file(config_path, config)
+
+    _load_config_from_env(config)
 
     return config
 
@@ -152,18 +160,12 @@ def _build_user_map(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {}
 
 
-def _filter_posts_payload(payload: Any, config: dict[str, Any]) -> Any:
-    if not isinstance(payload, dict):
-        return payload
-
-    if not config.get("enabled"):
-        return payload
-
-    posts = payload.get("posts")
-    if not isinstance(posts, list):
-        return payload
-
-    user_map = _build_user_map(payload)
+def _filter_posts_by_opt_out(
+    posts: list[dict[str, Any]],
+    user_map: dict[str, dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[list[dict[str, Any]], set[str], set[str]]:
+    """Filter posts and return kept posts, filtered users, and removed post IDs."""
     kept_posts: list[dict[str, Any]] = []
     filtered_users: set[str] = set()
     removed_post_ids: set[str] = set()
@@ -186,35 +188,58 @@ def _filter_posts_payload(payload: Any, config: dict[str, Any]) -> Any:
 
         kept_posts.append(post)
 
+    return kept_posts, filtered_users, removed_post_ids
+
+
+def _remove_related_content(
+    payload: dict[str, Any], removed_post_ids: set[str]
+) -> None:
+    """Remove comments and attachments related to filtered posts."""
+    timelines = payload.get("timelines")
+    if isinstance(timelines, dict) and isinstance(timelines.get("posts"), list):
+        timelines["posts"] = [
+            post_id for post_id in timelines["posts"] if post_id not in removed_post_ids
+        ]
+
+    comments = payload.get("comments")
+    if isinstance(comments, list):
+        payload["comments"] = [
+            comment
+            for comment in comments
+            if isinstance(comment, dict)
+            and comment.get("postId") not in removed_post_ids
+        ]
+
+    attachments = payload.get("attachments")
+    if isinstance(attachments, list):
+        payload["attachments"] = [
+            attachment
+            for attachment in attachments
+            if isinstance(attachment, dict)
+            and attachment.get("postId") not in removed_post_ids
+        ]
+
+
+def _filter_posts_payload(payload: Any, config: dict[str, Any]) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    if not config.get("enabled"):
+        return payload
+
+    posts = payload.get("posts")
+    if not isinstance(posts, list):
+        return payload
+
+    user_map = _build_user_map(payload)
+    kept_posts, filtered_users, removed_post_ids = _filter_posts_by_opt_out(
+        posts, user_map, config
+    )
+
     payload["posts"] = kept_posts
 
     if removed_post_ids:
-        timelines = payload.get("timelines")
-        if isinstance(timelines, dict) and isinstance(timelines.get("posts"), list):
-            timelines["posts"] = [
-                post_id
-                for post_id in timelines["posts"]
-                if post_id not in removed_post_ids
-            ]
-
-        comments = payload.get("comments")
-        if isinstance(comments, list):
-            payload["comments"] = [
-                comment
-                for comment in comments
-                if isinstance(comment, dict)
-                and comment.get("postId") not in removed_post_ids
-            ]
-
-        attachments = payload.get("attachments")
-        if isinstance(attachments, list):
-            payload["attachments"] = [
-                attachment
-                for attachment in attachments
-                if isinstance(attachment, dict)
-                and attachment.get("postId") not in removed_post_ids
-            ]
-
+        _remove_related_content(payload, removed_post_ids)
         payload["filtered_users"] = sorted(filtered_users)
         payload["filter_reason"] = FILTER_REASON
 
@@ -270,25 +295,20 @@ def _build_prompt(request: AssistantRequest) -> str:
     return f"{request.prompt}\n\nConstraints: {constraints_text}"
 
 
-def _get_agent() -> Agent:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not set")
+def _check_user_opt_out(
+    username: str, user_profile: dict[str, Any], ctx: RunContext[AssistantDeps]
+) -> Optional[dict[str, Any]]:
+    """Check if user opted out and return error response if so."""
+    if username and _should_skip_user(username, user_profile, ctx.deps.opt_out_config):
+        return {
+            "error": "User opted out of AI interactions",
+            "filtered_users": [username],
+            "filter_reason": FILTER_REASON,
+        }
+    return None
 
-    model_name = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
-    model = AnthropicModel(model_name, api_key=api_key)
 
-    system_prompt = (
-        "You are a FreeFeed assistant. Use tools to retrieve posts, users, or search "
-        "results before answering. Keep answers concise. If sources are available, "
-        "include post URLs in sources. Respect opt-out filtering signals and do not "
-        "summarize filtered content."
-    )
-
-    agent = Agent(
-        model=model, result_type=AssistantResponse, system_prompt=system_prompt
-    )
-
+def _register_timeline_tool(agent: Agent) -> None:
     @agent.tool
     async def get_timeline(
         ctx: RunContext[AssistantDeps],
@@ -309,6 +329,8 @@ def _get_agent() -> Agent:
         result = _filter_posts_payload(result, ctx.deps.opt_out_config)
         return _add_post_urls(result, ctx.deps.base_url)
 
+
+def _register_search_tool(agent: Agent) -> None:
     @agent.tool
     async def search_posts(
         ctx: RunContext[AssistantDeps],
@@ -327,6 +349,8 @@ def _get_agent() -> Agent:
         result = _filter_posts_payload(result, ctx.deps.opt_out_config)
         return _add_post_urls(result, ctx.deps.base_url)
 
+
+def _register_post_tool(agent: Agent) -> None:
     @agent.tool
     async def get_post(ctx: RunContext[AssistantDeps], post_id: str) -> dict[str, Any]:
         logger.info("assistant_tool request_id=%s tool=get_post", ctx.deps.request_id)
@@ -339,16 +363,13 @@ def _get_agent() -> Agent:
             username = (
                 user_profile.get("username") if isinstance(user_profile, dict) else None
             )
-            if username and _should_skip_user(
-                username, user_profile, ctx.deps.opt_out_config
-            ):
-                return {
-                    "error": "Post author opted out of AI interactions",
-                    "filtered_users": [username],
-                    "filter_reason": FILTER_REASON,
-                }
+            opt_out_response = _check_user_opt_out(username, user_profile, ctx)
+            if opt_out_response:
+                return opt_out_response
         return _add_post_urls(result, ctx.deps.base_url)
 
+
+def _register_profile_tool(agent: Agent) -> None:
     @agent.tool
     async def get_user_profile(
         ctx: RunContext[AssistantDeps], username: str
@@ -359,15 +380,36 @@ def _get_agent() -> Agent:
         result = await ctx.deps.client.get_user_profile(username)
         if isinstance(result, dict):
             user = result.get("users")
-            if isinstance(user, dict) and _should_skip_user(
-                username, user, ctx.deps.opt_out_config
-            ):
-                return {
-                    "error": "User opted out of AI interactions",
-                    "filtered_users": [username],
-                    "filter_reason": FILTER_REASON,
-                }
+            if isinstance(user, dict):
+                opt_out_response = _check_user_opt_out(username, user, ctx)
+                if opt_out_response:
+                    return opt_out_response
         return result
+
+
+def _get_agent() -> Agent:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set")
+
+    model_name = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+    model = AnthropicModel(model_name, api_key=api_key)
+
+    system_prompt = (
+        "You are a FreeFeed assistant. Use tools to retrieve posts, users, or search "
+        "results before answering. Keep answers concise. If sources are available, "
+        "include post URLs in sources. Respect opt-out filtering signals and do not "
+        "summarize filtered content."
+    )
+
+    agent = Agent(
+        model=model, result_type=AssistantResponse, system_prompt=system_prompt
+    )
+
+    _register_timeline_tool(agent)
+    _register_search_tool(agent)
+    _register_post_tool(agent)
+    _register_profile_tool(agent)
 
     return agent
 
