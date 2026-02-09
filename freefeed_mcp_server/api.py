@@ -137,6 +137,14 @@ def _sanitize_upload_filename(value: Optional[str]) -> str:
     return name
 
 
+RESPONSES_400 = {400: {"description": "Bad Request"}}
+RESPONSES_401 = {401: {"description": "Unauthorized"}}
+RESPONSES_500 = {500: {"description": "Internal Server Error"}}
+RESPONSES_400_500 = {**RESPONSES_400, **RESPONSES_500}
+RESPONSES_400_401 = {**RESPONSES_400, **RESPONSES_401}
+RESPONSES_400_401_500 = {**RESPONSES_400, **RESPONSES_401, **RESPONSES_500}
+
+
 # Initialize FastAPI app
 app = FastAPI(
     title="FreeFeed API",
@@ -389,7 +397,11 @@ async def health_check():
         return {"status": "unhealthy", "error": str(e)}
 
 
-@app.post("/api/session", response_model=SessionResponse)
+@app.post(
+    "/api/session",
+    response_model=SessionResponse,
+    responses=RESPONSES_400_401,
+)
 async def create_session(payload: SessionCreate) -> SessionResponse:
     """Create a server-side session using FreeFeed credentials."""
     client: Optional[FreeFeedClient] = None
@@ -426,7 +438,11 @@ async def create_session(payload: SessionCreate) -> SessionResponse:
                 await client.close()
 
 
-@app.post("/api/assistant", response_model=AssistantResponse)
+@app.post(
+    "/api/assistant",
+    response_model=AssistantResponse,
+    responses=RESPONSES_400_500,
+)
 async def assistant(payload: AssistantRequest, request: Request) -> AssistantResponse:
     """AI assistant endpoint backed by PydanticAI."""
     try:
@@ -441,7 +457,7 @@ async def assistant(payload: AssistantRequest, request: Request) -> AssistantRes
 # Timeline endpoints
 
 
-@app.get("/api/timeline")
+@app.get("/api/timeline", responses=RESPONSES_400_500)
 async def get_timeline(
     timeline_type: str = "home",
     username: Optional[str] = None,
@@ -464,7 +480,7 @@ async def get_timeline(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/directs")
+@app.get("/api/directs", responses=RESPONSES_400_500)
 async def get_directs(
     limit: Optional[int] = None,
     offset: Optional[int] = None,
@@ -484,7 +500,7 @@ async def get_directs(
 # Post endpoints
 
 
-@app.get("/api/posts/{post_id}")
+@app.get("/api/posts/{post_id}", responses=RESPONSES_400)
 async def get_post(post_id: str, request: Request):
     """Get a specific post."""
     try:
@@ -496,7 +512,7 @@ async def get_post(post_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/posts")
+@app.post("/api/posts", responses=RESPONSES_400)
 async def create_post(
     body: Annotated[str, Form(...)],
     group_names: Annotated[Optional[str], Form()] = None,
@@ -536,7 +552,7 @@ async def create_post(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/directs")
+@app.post("/api/directs", responses=RESPONSES_400_500)
 async def create_direct_post(data: DirectCreate, request: Request = None):
     """Create a direct post to one or more recipients."""
     try:
@@ -558,7 +574,7 @@ async def create_direct_post(data: DirectCreate, request: Request = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.put("/api/posts/{post_id}")
+@app.put("/api/posts/{post_id}", responses=RESPONSES_400)
 async def update_post(post_id: str, data: PostUpdate, request: Request):
     """Update a post."""
     try:
@@ -570,7 +586,7 @@ async def update_post(post_id: str, data: PostUpdate, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.delete("/api/posts/{post_id}")
+@app.delete("/api/posts/{post_id}", responses=RESPONSES_400)
 async def delete_post(post_id: str, request: Request):
     """Delete a post."""
     try:
@@ -582,7 +598,7 @@ async def delete_post(post_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/posts/{post_id}/leave")
+@app.post("/api/posts/{post_id}/leave", responses=RESPONSES_400)
 async def leave_direct(post_id: str, request: Request):
     """Leave a direct post thread."""
     try:
@@ -594,7 +610,7 @@ async def leave_direct(post_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/posts/{post_id}/like")
+@app.post("/api/posts/{post_id}/like", responses=RESPONSES_400)
 async def like_post(post_id: str, request: Request):
     """Like a post."""
     try:
@@ -606,7 +622,7 @@ async def like_post(post_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/posts/{post_id}/unlike")
+@app.post("/api/posts/{post_id}/unlike", responses=RESPONSES_400)
 async def unlike_post(post_id: str, request: Request):
     """Unlike a post."""
     try:
@@ -621,7 +637,7 @@ async def unlike_post(post_id: str, request: Request):
 # Attachment endpoints
 
 
-@app.post("/api/attachments")
+@app.post("/api/attachments", responses=RESPONSES_400)
 async def upload_attachment(file: Annotated[UploadFile, File(...)], request: Request):
     """Upload an attachment."""
     try:
@@ -636,7 +652,7 @@ async def upload_attachment(file: Annotated[UploadFile, File(...)], request: Req
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/posts/{post_id}/attachments")
+@app.get("/api/posts/{post_id}/attachments", responses=RESPONSES_400)
 async def get_post_attachments(post_id: str, request: Request):
     """Get attachments for a post."""
     try:
@@ -673,7 +689,7 @@ async def get_post_attachments(post_id: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/attachments/download")
+@app.get("/api/attachments/download", responses=RESPONSES_400)
 async def download_attachment(url: str, request: Request):
     """Download an attachment by URL."""
     try:
@@ -692,7 +708,7 @@ async def download_attachment(url: str, request: Request):
 # Comment endpoints
 
 
-@app.post("/api/posts/{post_id}/comments")
+@app.post("/api/posts/{post_id}/comments", responses=RESPONSES_400)
 async def add_comment(post_id: str, data: CommentCreate, request: Request):
     """Add a comment to a post."""
     try:
@@ -704,7 +720,7 @@ async def add_comment(post_id: str, data: CommentCreate, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.put("/api/comments/{comment_id}")
+@app.put("/api/comments/{comment_id}", responses=RESPONSES_400)
 async def update_comment(comment_id: str, data: CommentCreate, request: Request):
     """Update a comment."""
     try:
@@ -716,7 +732,7 @@ async def update_comment(comment_id: str, data: CommentCreate, request: Request)
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.delete("/api/comments/{comment_id}")
+@app.delete("/api/comments/{comment_id}", responses=RESPONSES_400)
 async def delete_comment(comment_id: str, request: Request):
     """Delete a comment."""
     try:
@@ -731,7 +747,7 @@ async def delete_comment(comment_id: str, request: Request):
 # Search endpoints
 
 
-@app.get("/api/search")
+@app.get("/api/search", responses=RESPONSES_400)
 async def search_posts(
     query: str,
     limit: Optional[int] = None,
@@ -750,7 +766,7 @@ async def search_posts(
 # User endpoints
 
 
-@app.get("/api/users/{username}")
+@app.get("/api/users/{username}", responses=RESPONSES_400)
 async def get_user_profile(username: str, request: Request):
     """Get user profile."""
     try:
@@ -762,7 +778,7 @@ async def get_user_profile(username: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/users/me")
+@app.get("/api/users/me", responses=RESPONSES_400)
 async def whoami(compact: bool = False, request: Request = None):
     """Get current authenticated user."""
     try:
@@ -775,7 +791,7 @@ async def whoami(compact: bool = False, request: Request = None):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/users/{username}/subscribers")
+@app.get("/api/users/{username}/subscribers", responses=RESPONSES_400)
 async def get_subscribers(username: str, request: Request):
     """Get user's subscribers."""
     try:
@@ -787,7 +803,7 @@ async def get_subscribers(username: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/users/{username}/subscriptions")
+@app.get("/api/users/{username}/subscriptions", responses=RESPONSES_400)
 async def get_subscriptions(username: str, request: Request):
     """Get user's subscriptions."""
     try:
@@ -799,7 +815,7 @@ async def get_subscriptions(username: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/users/{username}/subscribe")
+@app.post("/api/users/{username}/subscribe", responses=RESPONSES_400)
 async def subscribe_user(username: str, request: Request):
     """Subscribe to a user."""
     try:
@@ -811,7 +827,7 @@ async def subscribe_user(username: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.post("/api/users/{username}/unsubscribe")
+@app.post("/api/users/{username}/unsubscribe", responses=RESPONSES_400)
 async def unsubscribe_user(username: str, request: Request):
     """Unsubscribe from a user."""
     try:
@@ -826,7 +842,7 @@ async def unsubscribe_user(username: str, request: Request):
 # Group endpoints
 
 
-@app.get("/api/groups/my")
+@app.get("/api/groups/my", responses=RESPONSES_400)
 async def get_my_groups(request: Request):
     """Get list of groups user is member of."""
     try:
@@ -837,7 +853,7 @@ async def get_my_groups(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/groups/{group_name}")
+@app.get("/api/groups/{group_name}", responses=RESPONSES_400)
 async def get_group_info(group_name: str, request: Request):
     """Get information about a group."""
     try:
@@ -849,7 +865,7 @@ async def get_group_info(group_name: str, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.get("/api/groups/{group_name}/timeline")
+@app.get("/api/groups/{group_name}/timeline", responses=RESPONSES_400)
 async def get_group_timeline(
     group_name: str,
     limit: Optional[int] = None,

@@ -42,9 +42,7 @@ uvicorn freefeed_mcp_server.api:app --workers 4 --host 0.0.0.0 --port 8000
 
 After the server starts, interactive docs are available:
 
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
-- **OpenAPI JSON**: http://localhost:8000/openapi.json
+Error responses are explicitly documented in the OpenAPI specification for each endpoint.
 
 ## 🔌 Endpoints
 

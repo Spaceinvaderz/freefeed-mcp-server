@@ -8,6 +8,8 @@
 - Reject traversal characters in path parameters to avoid server-side path manipulation.
 - Constrain file uploads from disk to a configured upload directory.
 - Sanitize uploaded filenames to prevent path injection.
+- Document HTTP error responses in OpenAPI metadata for endpoints.
+- Fix async httpx event hooks to avoid NoneType await errors in logging.
 
 ## [0.2.0] - 2025-02-08
 

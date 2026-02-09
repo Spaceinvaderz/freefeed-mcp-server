@@ -119,7 +119,7 @@ class FreeFeedClient:
             },
         )
 
-    def _log_request(self, request: httpx.Request) -> None:
+    async def _log_request(self, request: httpx.Request) -> None:
         """Log outgoing requests in DEBUG mode."""
         if not logger.isEnabledFor(logging.DEBUG):
             return
@@ -137,7 +137,7 @@ class FreeFeedClient:
             headers,
         )
 
-    def _log_response(self, response: httpx.Response) -> None:
+    async def _log_response(self, response: httpx.Response) -> None:
         """Log incoming responses in DEBUG mode."""
         if not logger.isEnabledFor(logging.DEBUG):
             return
