@@ -36,3 +36,14 @@ This repository contains the FreeFeed MCP server (Python, FastAPI, MCP stdio).
 - Use Pydantic models for request/response schemas
 - Prefer returning structured JSON for tool outputs
 - When adding MCP tools, update docs and examples
+
+## Security Recommendations
+
+- Apply defense-in-depth: validate inputs at API boundaries and again before internal use.
+- Minimize attack surface: avoid exposing passthrough URLs or file paths without allowlists.
+- Enforce least privilege: scope credentials to the minimum required and avoid reusing user-supplied tokens across requests.
+- Validate inputs against strict schemas (type, length, charset); reject early with clear errors.
+- Sanitize strings before use in interpreted contexts (URLs, file paths, queries).
+- Keep security layers usable: defaults should be safe without breaking common workflows.
+- Handle internal errors defensively: no stack traces to clients; return safe, structured errors.
+- Separate concerns: isolate networking, storage, and auth logic into distinct modules.

@@ -8,6 +8,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from typing import Annotated, Any, List, Optional
+from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -108,6 +109,32 @@ def _add_post_urls(payload: Any, base_url: str) -> Any:
         _set_post_url(posts, base_url, user_map)
 
     return payload
+
+
+def _validate_path_segment(name: str, value: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise HTTPException(status_code=400, detail=f"Invalid {name}")
+    decoded = unquote(value)
+    if "/" in decoded or "\\" in decoded or ".." in decoded:
+        raise HTTPException(status_code=400, detail=f"Invalid {name}")
+
+
+def _validate_attachment_url(raw_url: str, base_url: str) -> None:
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="Invalid attachment url")
+    base_netloc = urlparse(base_url).netloc
+    allowed_hosts = {base_netloc, "media.freefeed.net"}
+    if parsed.netloc not in allowed_hosts or "/attachments/" not in parsed.path:
+        raise HTTPException(status_code=400, detail="Invalid attachment url")
+
+
+def _sanitize_upload_filename(value: Optional[str]) -> str:
+    name = (value or "").replace("\x00", "").strip()
+    name = os.path.basename(name)
+    if not name or name in {".", ".."}:
+        return "upload"
+    return name
 
 
 # Initialize FastAPI app
@@ -424,6 +451,8 @@ async def get_timeline(
 ):
     """Get timeline feed."""
     try:
+        if username:
+            _validate_path_segment("username", username)
         client = await _get_client_for_request(request)
         result = await client.get_timeline(
             username=username, timeline_type=timeline_type, limit=limit, offset=offset
@@ -459,6 +488,7 @@ async def get_directs(
 async def get_post(post_id: str, request: Request):
     """Get a specific post."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         result = await client.get_post(post_id)
         return _add_post_urls(result, client.base_url)
@@ -485,8 +515,9 @@ async def create_post(
         if files:
             for file in files:
                 file_data = await file.read()
+                safe_name = _sanitize_upload_filename(file.filename)
                 result = await client.upload_attachment(
-                    file_path=file.filename, file_data=file_data, filename=file.filename
+                    file_path=safe_name, file_data=file_data, filename=safe_name
                 )
                 # Extract attachment ID
                 if "attachments" in result:
@@ -531,6 +562,7 @@ async def create_direct_post(data: DirectCreate, request: Request = None):
 async def update_post(post_id: str, data: PostUpdate, request: Request):
     """Update a post."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         result = await client.update_post(post_id, data.body)
         return _add_post_urls(result, client.base_url)
@@ -542,6 +574,7 @@ async def update_post(post_id: str, data: PostUpdate, request: Request):
 async def delete_post(post_id: str, request: Request):
     """Delete a post."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         result = await client.delete_post(post_id)
         return result
@@ -553,6 +586,7 @@ async def delete_post(post_id: str, request: Request):
 async def leave_direct(post_id: str, request: Request):
     """Leave a direct post thread."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         result = await client.leave_direct(post_id)
         return result
@@ -564,6 +598,7 @@ async def leave_direct(post_id: str, request: Request):
 async def like_post(post_id: str, request: Request):
     """Like a post."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         result = await client.like_post(post_id)
         return result
@@ -575,6 +610,7 @@ async def like_post(post_id: str, request: Request):
 async def unlike_post(post_id: str, request: Request):
     """Unlike a post."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         result = await client.unlike_post(post_id)
         return result
@@ -591,8 +627,9 @@ async def upload_attachment(file: Annotated[UploadFile, File(...)], request: Req
     try:
         client = await _get_client_for_request(request)
         file_data = await file.read()
+        safe_name = _sanitize_upload_filename(file.filename)
         result = await client.upload_attachment(
-            file_path=file.filename, file_data=file_data, filename=file.filename
+            file_path=safe_name, file_data=file_data, filename=safe_name
         )
         return result
     except FreeFeedAPIError as e:
@@ -603,6 +640,7 @@ async def upload_attachment(file: Annotated[UploadFile, File(...)], request: Req
 async def get_post_attachments(post_id: str, request: Request):
     """Get attachments for a post."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         post_data = await client.get_post(post_id)
 
@@ -640,6 +678,7 @@ async def download_attachment(url: str, request: Request):
     """Download an attachment by URL."""
     try:
         client = await _get_client_for_request(request)
+        _validate_attachment_url(url, client.base_url)
         file_data = await client.download_attachment(url)
 
         # Return as streaming response
@@ -657,6 +696,7 @@ async def download_attachment(url: str, request: Request):
 async def add_comment(post_id: str, data: CommentCreate, request: Request):
     """Add a comment to a post."""
     try:
+        _validate_path_segment("post_id", post_id)
         client = await _get_client_for_request(request)
         result = await client.add_comment(post_id, data.body)
         return result
@@ -668,6 +708,7 @@ async def add_comment(post_id: str, data: CommentCreate, request: Request):
 async def update_comment(comment_id: str, data: CommentCreate, request: Request):
     """Update a comment."""
     try:
+        _validate_path_segment("comment_id", comment_id)
         client = await _get_client_for_request(request)
         result = await client.update_comment(comment_id, data.body)
         return result
@@ -679,6 +720,7 @@ async def update_comment(comment_id: str, data: CommentCreate, request: Request)
 async def delete_comment(comment_id: str, request: Request):
     """Delete a comment."""
     try:
+        _validate_path_segment("comment_id", comment_id)
         client = await _get_client_for_request(request)
         result = await client.delete_comment(comment_id)
         return result
@@ -712,6 +754,7 @@ async def search_posts(
 async def get_user_profile(username: str, request: Request):
     """Get user profile."""
     try:
+        _validate_path_segment("username", username)
         client = await _get_client_for_request(request)
         result = await client.get_user_profile(username)
         return result
@@ -736,6 +779,7 @@ async def whoami(compact: bool = False, request: Request = None):
 async def get_subscribers(username: str, request: Request):
     """Get user's subscribers."""
     try:
+        _validate_path_segment("username", username)
         client = await _get_client_for_request(request)
         result = await client.get_subscribers(username)
         return result
@@ -747,6 +791,7 @@ async def get_subscribers(username: str, request: Request):
 async def get_subscriptions(username: str, request: Request):
     """Get user's subscriptions."""
     try:
+        _validate_path_segment("username", username)
         client = await _get_client_for_request(request)
         result = await client.get_subscriptions(username)
         return result
@@ -758,6 +803,7 @@ async def get_subscriptions(username: str, request: Request):
 async def subscribe_user(username: str, request: Request):
     """Subscribe to a user."""
     try:
+        _validate_path_segment("username", username)
         client = await _get_client_for_request(request)
         result = await client.subscribe_user(username)
         return result
@@ -769,6 +815,7 @@ async def subscribe_user(username: str, request: Request):
 async def unsubscribe_user(username: str, request: Request):
     """Unsubscribe from a user."""
     try:
+        _validate_path_segment("username", username)
         client = await _get_client_for_request(request)
         result = await client.unsubscribe_user(username)
         return result
@@ -794,6 +841,7 @@ async def get_my_groups(request: Request):
 async def get_group_info(group_name: str, request: Request):
     """Get information about a group."""
     try:
+        _validate_path_segment("group_name", group_name)
         client = await _get_client_for_request(request)
         result = await client.get_group_info(group_name)
         return result
@@ -810,9 +858,10 @@ async def get_group_timeline(
 ):
     """Get timeline for a group."""
     try:
+        _validate_path_segment("group_name", group_name)
         client = await _get_client_for_request(request)
         result = await client.get_group_timeline(group_name, limit, offset)
-        return result
+        return _add_post_urls(result, client.base_url)
     except FreeFeedAPIError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -841,7 +890,6 @@ if __name__ == "__main__":
             print("")
             print("Run the certificate generation script:")
             print("   ./generate_cert.sh (Linux/macOS)")
-            print("   .\\generate_cert.ps1 (Windows)")
             print("")
             sys.exit(1)
 
@@ -860,7 +908,7 @@ if __name__ == "__main__":
     else:
         print("⚠️  Starting API server with HTTP (development only)")
         print("")
-        print("Use HTTPS for Claude Desktop:")
+        print("Use HTTPS for MCP server connection:")
         print("   python -m freefeed_mcp_server.api --ssl")
         print("")
         print(f"🌐 HTTP server available at: http://localhost:{port}")

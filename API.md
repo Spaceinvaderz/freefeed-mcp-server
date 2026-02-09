@@ -48,6 +48,8 @@ After the server starts, interactive docs are available:
 
 ## 🔌 Endpoints
 
+Path parameters are treated as single segments. Values containing slashes or ".." are rejected.
+
 ### Health check
 
 ```bash
@@ -210,6 +212,10 @@ curl http://localhost:8000/api/posts/POST_ID/attachments
 curl "http://localhost:8000/api/attachments/download?url=https://freefeed.net/attachments/att-id" \
   -o downloaded.jpg
 ```
+
+Attachment download only accepts FreeFeed attachment URLs on the main host or the media CDN.
+
+Uploaded filenames are sanitized to their basename and a safe default if empty.
 
 ### Comments
 

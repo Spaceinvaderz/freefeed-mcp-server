@@ -5,7 +5,7 @@ import mimetypes
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from uuid import UUID
 
 import httpx
@@ -337,9 +337,26 @@ class FreeFeedClient:
         Raises:
             FreeFeedAPIError: If file not found
         """
+
+        def _resolve_upload_path(raw_path: Union[str, Path]) -> Path:
+            base_dir = Path(os.getenv("FREEFEED_UPLOAD_DIR", ".")).expanduser()
+            base_dir = base_dir.resolve()
+            candidate = Path(raw_path).expanduser()
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+            else:
+                resolved = (base_dir / candidate).resolve()
+            try:
+                resolved.relative_to(base_dir)
+            except ValueError as exc:
+                raise FreeFeedAPIError(
+                    "Invalid file_path; must be within upload directory"
+                ) from exc
+            return resolved
+
         # Prepare file data
         if file_data is None:
-            path = Path(file_path)
+            path = _resolve_upload_path(file_path)
             if not path.exists():
                 raise FreeFeedAPIError(f"File not found: {file_path}")
             file_data = path.read_bytes()
@@ -424,6 +441,38 @@ class FreeFeedClient:
         Raises:
             FreeFeedAPIError: If download fails
         """
+
+        def _is_allowed_attachment_url(raw_url: str) -> bool:
+            parsed = urlparse(raw_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return False
+            base_netloc = urlparse(self.base_url).netloc
+            allowed_hosts = {base_netloc, "media.freefeed.net"}
+            if parsed.netloc not in allowed_hosts:
+                return False
+            return "/attachments/" in parsed.path
+
+        def _resolve_download_path(raw_path: Union[str, Path]) -> Path:
+            base_dir = Path(
+                os.getenv("FREEFEED_DOWNLOAD_DIR", "./downloads")
+            ).expanduser()
+            base_dir = base_dir.resolve()
+            candidate = Path(raw_path).expanduser()
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+            else:
+                resolved = (base_dir / candidate).resolve()
+            try:
+                resolved.relative_to(base_dir)
+            except ValueError as exc:
+                raise FreeFeedAPIError(
+                    "Invalid save_path; must be within download directory"
+                ) from exc
+            return resolved
+
+        if not _is_allowed_attachment_url(attachment_url):
+            raise FreeFeedAPIError("Attachment URL is not allowed")
+
         try:
             response = await self.client.get(attachment_url)
             response.raise_for_status()
@@ -431,11 +480,11 @@ class FreeFeedClient:
             file_data = response.content
 
             if save_path:
-                save_path = Path(save_path)
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                save_path.write_bytes(file_data)
-                logger.info(f"Downloaded attachment to {save_path}")
-                return save_path
+                resolved_path = _resolve_download_path(save_path)
+                resolved_path.parent.mkdir(parents=True, exist_ok=True)
+                resolved_path.write_bytes(file_data)
+                logger.info(f"Downloaded attachment to {resolved_path}")
+                return resolved_path
             else:
                 return file_data
 

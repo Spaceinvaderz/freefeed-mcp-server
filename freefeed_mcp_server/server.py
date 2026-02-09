@@ -306,17 +306,33 @@ def _extract_attachment_id(url: str) -> str | None:
     return candidate.split(".", 1)[0]
 
 
+def _is_allowed_attachment_url(client: FreeFeedClient, url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    base_netloc = urlparse(client.base_url).netloc
+    allowed_hosts = {base_netloc, "media.freefeed.net"}
+    if parsed.netloc not in allowed_hosts:
+        return False
+    return _extract_attachment_id(url) is not None
+
+
 def _get_fallback_urls(client: FreeFeedClient, attachment_url: str) -> list[str]:
     """Get list of fallback URLs to try for attachment."""
-    urls = [attachment_url]
     attachment_id = _extract_attachment_id(attachment_url)
-    if attachment_id:
-        fallback = f"{client.base_url}/attachments/{attachment_id}"
-        if fallback not in urls:
-            urls.append(fallback)
-        media_fallback = f"https://media.freefeed.net/attachments/{attachment_id}"
-        if media_fallback not in urls:
-            urls.append(media_fallback)
+    if not attachment_id:
+        return []
+
+    urls: list[str] = []
+    if _is_allowed_attachment_url(client, attachment_url):
+        urls.append(attachment_url)
+
+    fallback = f"{client.base_url}/attachments/{attachment_id}"
+    if fallback not in urls:
+        urls.append(fallback)
+    media_fallback = f"https://media.freefeed.net/attachments/{attachment_id}"
+    if media_fallback not in urls:
+        urls.append(media_fallback)
     return urls
 
 
@@ -394,11 +410,28 @@ async def _try_html_preview(
     return None
 
 
+async def _handle_html_attachment(
+    client: FreeFeedClient,
+    url: str,
+    max_bytes: int,
+) -> tuple[bytes | None, str | None, int | None, str | None] | None:
+    """Handle HTML attachment by attempting to fetch preview."""
+    preview_result = await _try_html_preview(client, url, max_bytes)
+    if preview_result:
+        data, content_type, size, error = preview_result
+        if not error:
+            return data, content_type, size, None
+    return None
+
+
 async def _fetch_attachment_data(
     client: FreeFeedClient, attachment_url: str, max_bytes: int
 ) -> tuple[bytes | None, str | None, int | None, str | None]:
     """Fetch and validate attachment data."""
     urls = _get_fallback_urls(client, attachment_url)
+
+    if not urls:
+        return None, None, None, "invalid_url"
 
     for url in urls:
         data, content_type, size, error = await _fetch_attachment_binary(
@@ -409,11 +442,9 @@ async def _fetch_attachment_data(
         if error:
             return data, content_type, size, error
         if content_type and content_type.startswith("text/html"):
-            preview_result = await _try_html_preview(client, url, max_bytes)
-            if preview_result:
-                data, content_type, size, error = preview_result
-                if not error:
-                    return data, content_type, size, None
+            result = await _handle_html_attachment(client, url, max_bytes)
+            if result:
+                return result
             return data, content_type, size, "html_response"
 
         return data, content_type, size, None

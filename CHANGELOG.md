@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.1] - 2026-02-09
+
+### Fixed
+- Restrict attachment download save paths to a safe download directory to prevent path traversal.
+- Validate attachment download URLs against allowed hosts and attachment paths to prevent SSRF.
+- Reject traversal characters in path parameters to avoid server-side path manipulation.
+- Constrain file uploads from disk to a configured upload directory.
+- Sanitize uploaded filenames to prevent path injection.
+
 ## [0.2.0] - 2025-02-08
 
 ### Added
@@ -61,7 +70,6 @@
 
 ### [0.2.0] - Planned
 - Group management (create, configure, admin)
-- Private messages
 - Extended user profile management
 
 ### [0.3.0] - Planned
