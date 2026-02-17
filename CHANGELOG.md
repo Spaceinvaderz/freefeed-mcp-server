@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Docker support: Dockerfile with multistage build for optimized image size
+- docker-compose.yml for easy deployment and development
+- .dockerignore for efficient container builds
+- DOCKER.md documentation with quick start and production deployment guides
+- Dual HTTP+HTTPS server support: when `FREEFEED_SSL_ENABLED=1`, runs both servers simultaneously
+  - HTTP server on port 8000 (configurable via `FREEFEED_API_PORT`)
+  - HTTPS server on port 8443 (configurable via `FREEFEED_API_HTTPS_PORT`)
+- API mode support in `__main__.py`: can run REST API server in Docker via `FREEFEED_API_MODE=1` env variable
+
 ## [0.2.1] - 2026-02-09
 
 ### Fixed

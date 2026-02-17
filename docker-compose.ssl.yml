@@ -1,0 +1,11 @@
+# Override configuration to enable SSL
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.ssl.yml up -d
+
+version: '3.8'
+
+services:
+  freefeed-mcp-server:
+    environment:
+      FREEFEED_SSL_ENABLED: "1"
+    volumes:
+      - ./certs:/app/certs:ro

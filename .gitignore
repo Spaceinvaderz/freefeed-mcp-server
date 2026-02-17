@@ -33,15 +33,24 @@ ENV/
 *.swo
 *~
 
-# Environment variables
-.env
-.env.local
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.VolumeIcon.icns
+.TemporaryItems
+.DocumentRevisions-V100
+.com.apple.timemachine.donotpresent
 
-# Testing
-.pytest_cache/
-.coverage
 htmlcov/
 
 # Logs
 *.log
 certs/*
+
+# Secrets
+.env
+.env.local
