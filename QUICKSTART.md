@@ -1,5 +1,7 @@
 # FreeFeed MCP Server - Quick Start
 
+> **Prefer Docker?** See [DOCKER.md](DOCKER.md) for Docker and docker-compose setup.
+
 ## 🚀 Install and run in 3 steps
 
 ### Step 1: Install dependencies

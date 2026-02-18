@@ -203,3 +203,96 @@ networks:
 ```
 
 Run with: `docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d`
+
+## Connecting from Other Docker Containers
+
+### Option 1: Using External Shared Network (Recommended)
+
+Create an external network that multiple docker-compose projects can share:
+
+```bash
+# 1. Create external network (one time only)
+# Option A: Manual
+docker network create freefeed-shared
+
+# Option B: Using setup script
+./setup-docker-network.sh
+
+# 2. Start freefeed-mcp-server with external network
+docker-compose -f docker-compose.yml -f docker-compose.external-network.yml up -d
+
+# 3. Verify the network
+docker network inspect freefeed-shared
+```
+
+Now other services can connect to this network and reach `freefeed-mcp-server` via DNS name:
+
+```yaml
+# Example: your-other-service/docker-compose.yml
+version: '3.8'
+
+services:
+  my-client:
+    image: my-client:latest
+    networks:
+      - freefeed-shared
+    environment:
+      FREEFEED_API_URL: http://freefeed-mcp-server:8000
+      # or for HTTPS (if enabled):
+      # FREEFEED_API_URL: https://freefeed-mcp-server:8443
+
+networks:
+  freefeed-shared:
+    external: true
+```
+
+### Option 2: Using Docker Run with Network
+
+```bash
+# Start freefeed-mcp-server with external network
+docker-compose -f docker-compose.yml -f docker-compose.external-network.yml up -d
+
+# Run another container on the same network
+docker run -it \
+  --network freefeed-shared \
+  --name my-client \
+  my-image:latest \
+  bash
+
+# Inside the container, you can reach the server:
+curl http://freefeed-mcp-server:8000/docs
+```
+
+### Option 3: Using Host Network (Development Only)
+
+For local development, connect via host IP:
+
+```bash
+# Get host IP (from inside container perspective)
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' freefeed-mcp-server
+
+# Then connect using that IP from another container
+curl http://172.17.0.1:8000/docs
+```
+
+### Service Discovery via DNS
+
+When using the same Docker network, the service name becomes available as DNS:
+
+- **Service name**: `freefeed-mcp-server` (from container_name in docker-compose.yml)
+- **HTTP endpoint**: `http://freefeed-mcp-server:8000`
+- **HTTPS endpoint**: `https://freefeed-mcp-server:8443` (if SSL enabled)
+- **API docs**: `http://freefeed-mcp-server:8000/docs`
+
+Example from inside another container:
+
+```bash
+curl http://freefeed-mcp-server:8000/users/me
+curl http://freefeed-mcp-server:8000/timeline
+```
+
+### See Also
+
+- [docker-compose.external-network.yml](docker-compose.external-network.yml) - Override for using external network
+- [docker-compose.example-client.yml](docker-compose.example-client.yml) - Example client configuration
+- [NETWORKS.md](NETWORKS.md) - Detailed guide on multiple networks configuration

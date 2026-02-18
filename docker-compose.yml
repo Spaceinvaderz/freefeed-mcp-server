@@ -31,7 +31,9 @@ services:
       - ./logs:/app/logs
     networks:
       - freefeed-network
-
-networks:
+      # - freefeed-shared
+  networks:
   freefeed-network:
     driver: bridge
+  # freefeed-shared:
+  #   external: true

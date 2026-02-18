@@ -11,6 +11,12 @@
   - HTTP server on port 8000 (configurable via `FREEFEED_API_PORT`)
   - HTTPS server on port 8443 (configurable via `FREEFEED_API_HTTPS_PORT`)
 - API mode support in `__main__.py`: can run REST API server in Docker via `FREEFEED_API_MODE=1` env variable
+- Docker networking support:
+  - `docker-compose.external-network.yml` for sharing network with other compose projects
+  - `docker-compose.example-client.yml` example of client service connecting to freefeed-mcp-server
+  - `setup-docker-network.sh` helper script to create external shared network
+  - Service discovery via DNS name within Docker networks
+  - Multiple network support (internal + external), see [NETWORKS.md](NETWORKS.md)
 
 ## [0.2.1] - 2026-02-09
 
