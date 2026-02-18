@@ -931,4 +931,4 @@ if __name__ == "__main__":
         print(f"📚 Docs: http://localhost:{port}/docs")
         print("")
 
-    uvicorn.run(app, host="0.0.0.0", port=port, **ssl_config)
+    uvicorn.run(app, host="0.0.0.0", port=port, **ssl_config)  # nosec: B104

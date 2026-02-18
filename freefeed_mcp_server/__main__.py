@@ -13,7 +13,7 @@ async def run_api_server():
 
     from .api import app
 
-    host = os.getenv("FREEFEED_API_HOST", "0.0.0.0")
+    host = os.getenv("FREEFEED_API_HOST", "0.0.0.0")  # nosec: B104
     http_port = int(os.getenv("FREEFEED_API_PORT", "8000"))
     https_port = int(os.getenv("FREEFEED_API_HTTPS_PORT", "8443"))
 

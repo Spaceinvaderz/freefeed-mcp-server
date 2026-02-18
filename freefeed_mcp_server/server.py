@@ -71,7 +71,7 @@ def _load_config_from_file(config: dict) -> None:
         return
 
     try:
-        with open(config_path, "r", encoding="utf-8") as handle:
+        with open(config_path, encoding="utf-8") as handle:
             data = json.load(handle)
         if not isinstance(data, dict):
             return
@@ -357,8 +357,8 @@ async def _fetch_attachment_binary(
             length_header = head.headers.get("content-length")
             if length_header and length_header.isdigit():
                 content_length = int(length_header)
-    except Exception:
-        pass
+    except Exception as e:  # nosec: B110
+        logger.debug("Failed to parse attachment headers: %s", e)
 
     if content_length is not None and content_length > max_bytes:
         return None, content_type, content_length, "too_large"
@@ -405,8 +405,8 @@ async def _try_html_preview(
                 preview_url,
             )
             return await _fetch_attachment_binary(client, preview_url, max_bytes)
-    except Exception:
-        pass
+    except Exception as e:  # nosec: B110
+        logger.debug("Failed to get attachment preview: %s", e)
     return None
 
 
