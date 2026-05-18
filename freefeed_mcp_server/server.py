@@ -19,6 +19,7 @@ from mcp.server import Server
 from mcp.types import ImageContent, TextContent, Tool
 
 from .client import FreeFeedAPIError, FreeFeedAuthError, FreeFeedClient
+from .filters import slim_response
 
 # Load environment variables
 load_dotenv()
@@ -666,13 +667,29 @@ async def list_tools() -> list[Tool]:
         # Post tools
         Tool(
             name="get_post",
-            description="Get a specific post by ID with all comments",
+            description="Get a specific post by ID with comments and likes",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "post_id": {
                         "type": "string",
                         "description": "Post ID",
+                    },
+                    "max_comments": {
+                        "description": 'Max comments to return. Use "all" (default) for all comments, or a number to limit (shows first + last boundary comments and omits the middle).',
+                        "default": "all",
+                        "oneOf": [
+                            {"type": "string", "enum": ["all"]},
+                            {"type": "integer", "minimum": 1},
+                        ],
+                    },
+                    "max_likes": {
+                        "description": 'Max likes to return. Use "all" (default) for all likes, or a number to limit.',
+                        "default": "all",
+                        "oneOf": [
+                            {"type": "string", "enum": ["all"]},
+                            {"type": "integer", "minimum": 1},
+                        ],
                     },
                 },
                 "required": ["post_id"],
@@ -1152,7 +1169,11 @@ async def _handle_tool_directs(client: FreeFeedClient, arguments: Any) -> Any:
 
 async def _handle_tool_get_post(client: FreeFeedClient, arguments: Any) -> Any:
     """Handle get_post tool."""
-    result = await client.get_post(arguments["post_id"])
+    result = await client.get_post(
+        arguments["post_id"],
+        max_comments=arguments.get("max_comments", "all"),
+        max_likes=arguments.get("max_likes", "all"),
+    )
     user_map = _build_user_map(result)
     post = result.get("posts") if isinstance(result, dict) else None
     if isinstance(post, dict):
@@ -1523,6 +1544,15 @@ async def _handle_tool_get_group_info(client: FreeFeedClient, arguments: Any) ->
     return await client.get_group_info(arguments["group_name"])
 
 
+# Tools whose responses should be slimmed to reduce token consumption
+_SLIM_TOOLS = frozenset({
+    "get_timeline",
+    "get_directs",
+    "get_post",
+    "search_posts",
+    "get_group_timeline",
+})
+
 # Tool handler dispatch map
 _TOOL_HANDLERS = {
     "get_timeline": _handle_tool_timeline,
@@ -1581,6 +1611,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent | ImageConten
             result = result_dict
 
         result = _add_post_urls(result, client.base_url)
+        if name in _SLIM_TOOLS:
+            result = slim_response(result, keep_comments=(name == "get_post"))
         elapsed_ms = (time.monotonic() - start_time) * 1000
         logger.info(MCP_TOOL_SUCCESS_LOG, name, elapsed_ms)
         return [
